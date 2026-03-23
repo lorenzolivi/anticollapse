@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+title: "Anti-Collapse Dynamics in Gated Recurrent Neural Networks"
+message: "Template citation metadata only. Public manuscript links, DOI, and preferred citation will be added later."
+authors:
+  - family-names: Livi
+    given-names: Lorenzo
+type: software
+license: MIT
