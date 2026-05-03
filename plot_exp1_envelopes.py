@@ -333,8 +333,10 @@ def main():
         plt.savefig(os.path.join(outdir, "log_envelope_vs_log_ell.png"), dpi=args.dpi, bbox_inches="tight")
     plt.close()
 
-    # ---- Plot 4: Fit R^2 bar (if JSONs exist)
+    # ---- Plot 4: Fit R^2 bar + AIC winner annotation (if JSONs exist)
     names, exp_r2, pow_r2, temp_r2 = [], [], [], []
+    aic_winners = []
+    ell_stars = []
     for k in keys:
         fit = env_fit.get(k)
         if not isinstance(fit, dict):
@@ -347,23 +349,174 @@ def main():
             exp_r2.append(float(e.get("r2", np.nan)))
             pow_r2.append(float(p.get("r2", np.nan)))
             temp_r2.append(float(t.get("r2", np.nan)))
+            # AIC winner
+            # NOTE: aic dict uses "exponential" key, but fit sub-dicts use "exp"
+            aic = fit.get("aic", {}) or {}
+            winner = fit.get("envelope_winner", "")
+            if not winner and aic:
+                # Compute winner from AIC scores (keys: exponential, power, tempered)
+                aic_vals = {m: aic.get(m, float("inf"))
+                            for m in ["exponential", "power", "tempered"]}
+                winner = min(aic_vals, key=aic_vals.get)
+            aic_winners.append(winner)
+            # ell_star from tempered fit
+            ell_star = t.get("ell_star", np.nan)
+            ell_stars.append(float(ell_star) if ell_star is not None else np.nan)
 
     if names:
         x = np.arange(len(names))
         width = 0.26
-        plt.figure(figsize=(10.5, 4.2))
-        plt.bar(x - width, exp_r2, width=width, label="exp fit R$^2$")
-        plt.bar(x, pow_r2, width=width, label="power fit R$^2$")
-        plt.bar(x + width, temp_r2, width=width, label="tempered fit R$^2$")
+        plt.figure(figsize=(10.5, 4.8))
+        bars_e = plt.bar(x - width, exp_r2, width=width, label="exp fit R$^2$")
+        bars_p = plt.bar(x, pow_r2, width=width, label="power fit R$^2$")
+        bars_t = plt.bar(x + width, temp_r2, width=width, label="tempered fit R$^2$")
+
+        # Annotate AIC winner with a star marker
+        for i, winner in enumerate(aic_winners):
+            if winner == "mixed":
+                continue
+            if winner == "exponential":
+                plt.plot(x[i] - width, min(exp_r2[i] + 0.03, 1.0), "*", color="gold", markersize=12)
+            elif winner == "power":
+                plt.plot(x[i], min(pow_r2[i] + 0.03, 1.0), "*", color="gold", markersize=12)
+            elif winner == "tempered":
+                plt.plot(x[i] + width, min(temp_r2[i] + 0.03, 1.0), "*", color="gold", markersize=12)
+
+        # Annotate ell_star below x-axis labels
+        for i, ell_s in enumerate(ell_stars):
+            if np.isfinite(ell_s):
+                plt.text(x[i], -0.08, rf"$\ell^*$={ell_s:.0f}", ha="center", fontsize=7,
+                         color="purple", transform=plt.gca().get_xaxis_transform())
+
         plt.xticks(x, names, rotation=0, ha="center", fontsize=9)
-        plt.ylim(0.0, 1.01)
+        plt.ylim(0.0, 1.08)
         plt.ylabel(r"$R^2$")
-        plt.title("Envelope fit quality comparison (final only)")
+        plt.title(r"Envelope fit quality comparison (final only; $\bigstar$ = AIC winner)")
         plt.grid(True, axis="y", alpha=0.25)
         plt.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "envelope_fit_r2_bar.png"), dpi=args.dpi, bbox_inches="tight")
         plt.close()
+
+    # ---- Plot 5: AIC comparison bar chart (if AIC data available)
+    aic_names, aic_exp, aic_pow, aic_temp = [], [], [], []
+    for k in keys:
+        fit = env_fit.get(k)
+        if not isinstance(fit, dict):
+            continue
+        aic = fit.get("aic", {}) or {}
+        if aic:
+            aic_names.append(k)
+            aic_exp.append(float(aic.get("exponential", np.nan)))
+            aic_pow.append(float(aic.get("power", np.nan)))
+            aic_temp.append(float(aic.get("tempered", np.nan)))
+
+    if aic_names:
+        x = np.arange(len(aic_names))
+        width = 0.26
+        plt.figure(figsize=(10.5, 4.2))
+        plt.bar(x - width, aic_exp, width=width, label="exp AIC")
+        plt.bar(x, aic_pow, width=width, label="power AIC")
+        plt.bar(x + width, aic_temp, width=width, label="tempered AIC")
+        plt.xticks(x, aic_names, rotation=0, ha="center", fontsize=9)
+        plt.ylabel("AIC")
+        plt.title("Envelope AIC comparison (lower = better)")
+        plt.grid(True, axis="y", alpha=0.25)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "envelope_aic_bar.png"), dpi=args.dpi, bbox_inches="tight")
+        plt.close()
+
+    # ---- Plot 6: Crossover residual diagnostic (Section 7) ----
+    # One sub-panel per model with a valid crossover_diagnostic dict.
+    cd_models = []
+    for k in keys:
+        fit = env_fit.get(k)
+        if not isinstance(fit, dict):
+            continue
+        cd = fit.get("crossover_diagnostic", {})
+        if cd.get("valid"):
+            cd_models.append(k)
+
+    if cd_models:
+        ncols = min(len(cd_models), 3)
+        nrows = (len(cd_models) + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5.0 * ncols, 3.8 * nrows),
+                                 squeeze=False)
+
+        for idx, k in enumerate(cd_models):
+            ax = axes[idx // ncols, idx % ncols]
+            fit = env_fit[k]
+            cd = fit["crossover_diagnostic"]
+            d = env_data[k]
+            ell = d["ell"]
+            log_mu = np.log(np.maximum(d["mu"], 1e-30))
+
+            if cd.get("mode") == "anti_collapsed":
+                # Compute tempered-fit residuals for display
+                tempered = fit.get("tempered", {})
+                log_ell = np.log(ell + 1e-12)
+                pred_temp = (tempered.get("a", 0) + tempered.get("d_log", 0) * log_ell
+                             + tempered.get("b_ell", 0) * ell)
+                resid = log_mu - pred_temp
+                ell_star = cd["ell_star"]
+
+                below_mask = ell <= ell_star
+                above_mask = ell > ell_star
+
+                ax.scatter(ell[below_mask], resid[below_mask], s=12, alpha=0.6,
+                           color="steelblue", label=r"$\ell \leq \ell^*$", zorder=3)
+                ax.scatter(ell[above_mask], resid[above_mask], s=12, alpha=0.6,
+                           color="tomato", label=r"$\ell > \ell^*$", zorder=3)
+                ax.axvline(ell_star, color="grey", ls="--", lw=1.0, alpha=0.7,
+                           label=rf"$\ell^* = {ell_star:.1f}$")
+                ax.axhline(0, color="black", lw=0.5, alpha=0.4)
+
+                runs_p = cd.get("runs_below_p", float("nan"))
+                sign_p = cd.get("sign_above_p", float("nan"))
+                runs_ok = cd.get("runs_below_pass", False)
+                sign_ok = cd.get("sign_above_pass", False)
+
+                ann = (f"Below: runs p={runs_p:.3f} {'OK' if runs_ok else 'FAIL'}\n"
+                       f"Above: sign p={sign_p:.3f} {'OK' if sign_ok else 'FAIL'}")
+                ax.text(0.97, 0.97, ann, transform=ax.transAxes, va="top", ha="right",
+                        fontsize=7, family="monospace",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="grey", alpha=0.85))
+
+                ax.set_title(f"{k} — crossover residuals", fontsize=10)
+                ax.set_ylabel("Tempered-fit residual")
+
+            else:  # collapsed mode
+                efit = fit.get("exp", {})
+                pred_exp = efit.get("a", 0) + efit.get("b", 0) * ell
+                resid = log_mu - pred_exp
+
+                ax.scatter(ell, resid, s=12, alpha=0.6, color="grey", zorder=3)
+                ax.axhline(0, color="black", lw=0.5, alpha=0.4)
+
+                runs_p = cd.get("runs_exp_p", float("nan"))
+                runs_ok = cd.get("runs_exp_pass", False)
+                r2 = cd.get("r2_exp", float("nan"))
+                ann = f"Exp R²={r2:.3f}\nRuns p={runs_p:.3f} {'OK' if runs_ok else 'FAIL'}"
+                ax.text(0.97, 0.97, ann, transform=ax.transAxes, va="top", ha="right",
+                        fontsize=7, family="monospace",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="grey", alpha=0.85))
+
+                ax.set_title(f"{k} — exp residuals (collapsed)", fontsize=10)
+                ax.set_ylabel("Exp-fit residual")
+
+            ax.set_xlabel("Lag ℓ")
+            ax.legend(fontsize=7, loc="lower left")
+            ax.grid(True, alpha=0.2)
+
+        # Blank out unused axes
+        for idx in range(len(cd_models), nrows * ncols):
+            axes[idx // ncols, idx % ncols].set_visible(False)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "envelope_crossover_diagnostic.png"),
+                    dpi=args.dpi, bbox_inches="tight")
+        plt.close(fig)
 
     print(f"[OK] Saved envelope plots to: {outdir}")
 

@@ -46,11 +46,12 @@ import torch
 import torch.nn.functional as F
 
 from models import build_model, BaseRNN
-from data import make_dataset_cpu
+from data import make_dataset_cpu, sample_heavy_tailed_lags, build_task_coeffs
 from diagnostics import (
     log,
     run_checkpoint_diagnostics,
     compute_and_save_final_envelopes,
+    detect_threshold_crossing,
 )
 from seed_utils import write_csv, append_csv_row
 
@@ -70,6 +71,12 @@ def resolve_device(requested: str) -> torch.device:
         return torch.device(requested)
     if torch.cuda.is_available():
         return torch.device("cuda")
+    # Note: MPS is intentionally NOT auto-selected. The diagnostic
+    # pipeline (transport.py, diagnostics.py, diagnostics/diag_utils.py)
+    # uses float64 cumulative log-sums on the device for numerical
+    # stability of the τ-spectrum estimation, and MPS does not support
+    # float64. Until the diagnostic float64 work is moved to CPU
+    # explicitly, --device auto on macOS must fall through to CPU.
     return torch.device("cpu")
 
 
@@ -102,11 +109,13 @@ TRAJ_COLS = [
     "alpha_hat", "alpha_ecf", "alpha_mcculloch",
     "sigma_alpha_hat", "alpha_hat_std", "alpha_hat_se", "alpha_agreement",
     "beta_hat", "beta_r2",
+    "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "beta_bootstrap_B_eff",
     "tau_mean", "tau_q90", "tau_q99",
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
     "beta_env", "beta_env_r2",
+    "phase_label",
 ]
 
 
@@ -172,6 +181,7 @@ def train_with_phase_tracking(
 
     nan_halt = False
     global_step = 0
+    trajectory_rows = []  # accumulate checkpoint rows for threshold-crossing detection
     for ep in range(1, int(args.epochs) + 1):
         model.train()
         perm = torch.randperm(Btot)
@@ -231,6 +241,7 @@ def train_with_phase_tracking(
                 step=global_step,
             )
             append_csv_row(traj_csv, [row[k] for k in TRAJ_COLS])
+            trajectory_rows.append(row)
 
             # Optionally save model checkpoint
             if getattr(args, 'save_model_checkpoints', False):
@@ -241,6 +252,11 @@ def train_with_phase_tracking(
 
     if args.save_final_envelope and not nan_halt:
         # Final GELR envelope diagnostics need the live optimizer state.
+        # Also runs definitive phase classification (Table 1 with AIC).
+        # NOTE: the canonical final_phase.json is only emitted when
+        # --save_final_envelope is set.  Paper runs should always use
+        # this flag; otherwise only checkpoint-level (provisional)
+        # phase labels are available.
         log(f"[final:{model_name}] computing transport and GELR envelopes ...")
         compute_and_save_final_envelopes(
             model_name=model_name,
@@ -251,7 +267,31 @@ def train_with_phase_tracking(
             device=device,
             ells=ells,
             diag_batch_size=int(args.diag_batch_size),
+            fit_lags=fit_lags,
+            tau_ccdf_qmin=float(args.tau_ccdf_qmin),
+            tau_ccdf_qmax=float(args.tau_ccdf_qmax),
+            beta_bootstrap_B=int(args.beta_bootstrap_B),
+            beta_bootstrap_ci=float(args.beta_bootstrap_ci),
+            phase_r2_threshold=float(args.phase_r2_threshold),
         )
+
+    # Threshold-crossing detection
+    tcross = detect_threshold_crossing(trajectory_rows, persistence=2)
+    tcross_path = os.path.join(mdir, f"{model_name}_threshold_crossing.json")
+    with open(tcross_path, "w") as f:
+        json.dump(tcross, f, indent=2, default=str)
+    if tcross["crossed"]:
+        log(f"[tcross:{model_name}] threshold crossed at step "
+            f"{tcross['t_cross_step']} (epoch {tcross['t_cross_epoch']}), "
+            f"alpha={tcross['alpha_at_cross']}, "
+            f"beta_env={tcross['beta_env_at_cross']}")
+    elif tcross.get("left_censored"):
+        log(f"[tcross:{model_name}] already anti-collapsed at the first "
+            f"observed checkpoint (left-censored at step "
+            f"{tcross['first_observed_step']})")
+    else:
+        log(f"[tcross:{model_name}] never crossed threshold "
+            f"(right-censored at step {tcross['horizon_step']})")
 
     log(f"[train:{model_name}] done")
 
@@ -338,6 +378,21 @@ def parse_args():
     p.add_argument("--task_coeffs", type=str, default="0.6,0.5,0.4,0.32,0.26")
     p.add_argument("--noise_std", type=float, default=0.3)
 
+    # Task variant: fixed-lag (default) or heavy-tailed-lag (truncated Pareto on lags).
+    # The heavy-tailed-lag variant overrides --task_lags/--task_coeffs at runtime.
+    p.add_argument("--task_variant", type=str, default="fixed",
+                   choices=["fixed", "heavy_tail"])
+    p.add_argument("--task_alpha", type=float, default=1.0,
+                   help="Tail index α_task for truncated Pareto lag distribution (heavy_tail variant)")
+    p.add_argument("--task_lag_min", type=int, default=8)
+    p.add_argument("--task_lag_max", type=int, default=384)
+    p.add_argument("--task_K", type=int, default=8,
+                   help="Number of target lags sampled in heavy_tail variant")
+    p.add_argument("--task_coeff_base", type=float, default=0.6)
+    p.add_argument("--task_coeff_decay", type=float, default=0.85)
+    p.add_argument("--task_lag_seed", type=int, default=20260410,
+                   help="Seed for sampling the per-realization lag set (heavy_tail variant)")
+
     # Checkpointing
     p.add_argument("--diag_batch_size", type=int, default=256)
     p.add_argument("--checkpoint_every", type=int, default=50)
@@ -361,6 +416,16 @@ def parse_args():
     p.add_argument("--tau_ccdf_qmin", type=float, default=0.75)
     p.add_argument("--tau_ccdf_qmax", type=float, default=0.995)
 
+    # Bootstrap β̂ over neuron population
+    p.add_argument("--beta_bootstrap_B", type=int, default=2000,
+                   help="Number of bootstrap resamples for beta stability interval")
+    p.add_argument("--beta_bootstrap_ci", type=float, default=0.90,
+                   help="Confidence level for bootstrap percentile interval")
+
+    # Phase classification
+    p.add_argument("--phase_r2_threshold", type=float, default=0.90,
+                   help="R² threshold for CCDF tail fit to be considered reliable")
+
     # Saving
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
     p.add_argument("--save_final_envelope", action="store_true")
@@ -371,8 +436,25 @@ def parse_args():
                    choices=["auto", "cpu", "mps", "cuda"])
 
     args = p.parse_args()
-    args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip()]
-    args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip()]
+    if args.task_variant == "fixed":
+        args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip()]
+        args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip()]
+    elif args.task_variant == "heavy_tail":
+        rng = np.random.default_rng(args.task_lag_seed)
+        args.task_lags = sample_heavy_tailed_lags(
+            K=args.task_K,
+            lag_min=args.task_lag_min,
+            lag_max=args.task_lag_max,
+            alpha_task=args.task_alpha,
+            rng=rng,
+        )
+        args.task_coeffs = build_task_coeffs(
+            K=len(args.task_lags),
+            coeff_base=args.task_coeff_base,
+            coeff_decay=args.task_coeff_decay,
+        )
+    else:
+        raise ValueError(f"Unknown task_variant={args.task_variant}")
     assert len(args.task_lags) == len(args.task_coeffs)
     return args
 

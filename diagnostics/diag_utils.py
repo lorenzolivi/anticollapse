@@ -5,12 +5,18 @@ Shared utilities for anticollapse diagnostic experiments.
 =========================================================
 
 Contains:
-  - Model definitions (ConstGate, DiagGate, GRU, LSTM)
-  - Synthetic dataset generation
-  - First-order diagonal expansion (prefix-sum mu_tl computation)
-  - Per-neuron tau extraction from asymptotic slopes
-  - Envelope construction and comparison metrics
-  - Bridges to the main diagnostics pipeline for GELR/Rayleigh validation
+  - Dataset generation and training loop for diagnostic runs
+  - Per-neuron envelope computation and tau extraction
+  - Mixture construction and GELR-weighted envelope
+  - Comparison metrics (correlation, RMSE, relative error)
+  - I/O helpers
+
+Model definitions and transport functions are imported from the
+canonical modules (models.py, transport.py) in the project root.
+
+Refactored 2026-03: removed inline copies of model classes and
+transport functions.  All code now uses the single canonical
+implementation in transport.py and models.py.
 """
 
 import csv
@@ -26,6 +32,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from scipy import stats
+
+# ============================================================
+# Import canonical modules from project root
+# ============================================================
+
+def _project_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _ensure_root_on_path():
+    root = _project_root()
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_ensure_root_on_path()
+
+# Import canonical transport functions (single source of truth)
+from transport import (  # noqa: E402
+    precompute_prefix_sums,
+    mu_diag_product_first_order,
+    mu_diag_product_first_order_matched,
+    prod_from_prefix,
+    prod_from_prefix_matched,
+    compute_mu_tl_for_lag,
+    compute_mu_tl_for_matched_stat,
+)
+
+# Import canonical model definitions (single source of truth)
+from models import (  # noqa: E402
+    BaseRNN,
+    ConstGateRNN,
+    SharedGateRNN,
+    DiagGateRNN,
+    GRUCustom,
+    LSTMCustom,
+)
 
 
 # ============================================================
@@ -52,10 +95,6 @@ def resolve_device(requested: str = "auto") -> torch.device:
 _MAIN_DIAGNOSTICS = None
 
 
-def _project_root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
 def load_main_diagnostics_module():
     """Load the root diagnostics.py so sidecar checks reuse main-pipeline logic."""
     global _MAIN_DIAGNOSTICS
@@ -63,9 +102,6 @@ def load_main_diagnostics_module():
         return _MAIN_DIAGNOSTICS
 
     root = _project_root()
-    if root not in sys.path:
-        sys.path.insert(0, root)
-
     module_path = os.path.join(root, "diagnostics.py")
     spec = importlib.util.spec_from_file_location(
         "_anticollapse_main_diagnostics", module_path
@@ -115,270 +151,16 @@ def make_dataset(Nseq: int, T: int, D: int,
 
 
 # ============================================================
-# Models
+# Model and optimizer construction
 # ============================================================
 
-class BaseRNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x, return_intermediates=True):
-        return self.forward_with_intermediates(x, return_intermediates=return_intermediates)
-
-    def apply_orthogonal(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear) and m.weight is not None and m.weight.ndim == 2:
-                if getattr(m, '_skip_orth', False):
-                    continue
-                nn.init.orthogonal_(m.weight)
-
-    def neuron_param_indices(self, q: int) -> Dict[str, List[int]]:
-        """
-        Return dict mapping param_name -> list of flat indices
-        that 'belong' to neuron q (row q for weight matrices, element q for biases).
-        Subclasses should override for architecture-specific mapping.
-        """
-        raise NotImplementedError
-
-
-class ConstGateRNN(BaseRNN):
-    def __init__(self, D: int, H: int, s: float = 0.7):
-        super().__init__()
-        self.D, self.H = D, H
-        self.Wx = nn.Linear(D, H)
-        self.Wh = nn.Linear(H, H, bias=False)
-        self.out = nn.Linear(H, 1)
-        s = float(np.clip(s, 1e-6, 1.0 - 1e-6))
-        self.register_buffer("s_const", torch.tensor(s, dtype=torch.float32))
-        nn.init.zeros_(self.Wx.bias)
-        nn.init.zeros_(self.out.bias)
-
-    def forward_with_intermediates(self, x, return_intermediates=True):
-        B, T, _ = x.shape
-        h = torch.zeros(B, self.H, device=x.device)
-        s = self.s_const
-        ys = []
-        hs = []
-        if return_intermediates:
-            wh_diag = torch.diagonal(self.Wh.weight, 0)
-            leaks, rdiags = [], []
-        for t in range(T):
-            h_prev = h
-            pre = self.Wx(x[:, t]) + self.Wh(h_prev)
-            h_tilde = torch.tanh(pre)
-            h = (1 - s) * h_prev + s * h_tilde
-            ys.append(self.out(h))
-            hs.append(h)
-            if return_intermediates:
-                sH = s.expand(B, self.H)
-                leak = torch.clamp(1 - sH, 1e-12, 1.0)
-                tanh_prime = 1.0 - h_tilde ** 2
-                rdiag = (sH * tanh_prime) * wh_diag.view(1, -1)
-                leaks.append(leak)
-                rdiags.append(rdiag)
-        y = torch.stack(ys, dim=1)
-        if not return_intermediates:
-            return y, None, None
-        return y, torch.stack(hs, dim=1), {"leak": torch.stack(leaks, dim=1),
-                                           "rdiag": torch.stack(rdiags, dim=1)}
-
-    def neuron_param_indices(self, q):
-        idx = {}
-        # Wx.weight: (H, D) -> row q
-        idx["Wx.weight"] = list(range(q * self.D, (q + 1) * self.D))
-        # Wx.bias: (H,) -> element q
-        idx["Wx.bias"] = [q]
-        # Wh.weight: (H, H) -> row q
-        idx["Wh.weight"] = list(range(q * self.H, (q + 1) * self.H))
-        return idx
-
-
-class DiagGateRNN(BaseRNN):
-    def __init__(self, D: int, H: int, init_s: float = 0.005):
-        super().__init__()
-        self.D, self.H = D, H
-        self.Wx = nn.Linear(D, H)
-        self.Wh = nn.Linear(H, H, bias=False)
-        self.Ws = nn.Linear(D, H, bias=True)
-        self.Us = nn.Linear(H, H, bias=False)
-        self.Ws._skip_orth = True
-        self.Us._skip_orth = True
-        self.out = nn.Linear(H, 1)
-        nn.init.zeros_(self.Wx.bias)
-        nn.init.zeros_(self.out.bias)
-        nn.init.zeros_(self.Ws.weight)
-        nn.init.zeros_(self.Us.weight)
-        init_s = float(np.clip(init_s, 1e-6, 1.0 - 1e-6))
-        gate_bias = float(np.log(init_s / (1.0 - init_s)))
-        nn.init.constant_(self.Ws.bias, gate_bias)
-
-    def forward_with_intermediates(self, x, return_intermediates=True):
-        B, T, _ = x.shape
-        h = torch.zeros(B, self.H, device=x.device)
-        ys = []
-        hs = []
-        if return_intermediates:
-            wh_diag = torch.diagonal(self.Wh.weight, 0)
-            us_diag = torch.diagonal(self.Us.weight, 0)
-            leaks, rdiags = [], []
-        for t in range(T):
-            h_prev = h
-            a_s = self.Ws(x[:, t]) + self.Us(h_prev)
-            s = torch.sigmoid(a_s)
-            pre = self.Wx(x[:, t]) + self.Wh(h_prev)
-            h_tilde = torch.tanh(pre)
-            h = (1 - s) * h_prev + s * h_tilde
-            ys.append(self.out(h))
-            hs.append(h)
-            if return_intermediates:
-                leak = torch.clamp(1 - s, 1e-12, 1.0)
-                tanh_prime = 1.0 - h_tilde ** 2
-                s_prime = s * (1 - s)
-                rdiag_gate = (h_tilde - h_prev) * (s_prime * us_diag.view(1, -1))
-                rdiag_rec = (s * tanh_prime) * wh_diag.view(1, -1)
-                leaks.append(leak)
-                rdiags.append(rdiag_gate + rdiag_rec)
-        y = torch.stack(ys, dim=1)
-        if not return_intermediates:
-            return y, None, None
-        return y, torch.stack(hs, dim=1), {"leak": torch.stack(leaks, dim=1),
-                                           "rdiag": torch.stack(rdiags, dim=1)}
-
-    def neuron_param_indices(self, q):
-        idx = {}
-        idx["Wx.weight"] = list(range(q * self.D, (q + 1) * self.D))
-        idx["Wx.bias"] = [q]
-        idx["Wh.weight"] = list(range(q * self.H, (q + 1) * self.H))
-        idx["Ws.weight"] = list(range(q * self.D, (q + 1) * self.D))
-        idx["Ws.bias"] = [q]
-        idx["Us.weight"] = list(range(q * self.H, (q + 1) * self.H))
-        return idx
-
-
-class GRUCustom(BaseRNN):
-    def __init__(self, D: int, H: int):
-        super().__init__()
-        self.D, self.H = D, H
-        self.Wz = nn.Linear(D, H); self.Uz = nn.Linear(H, H, bias=False)
-        self.Wr = nn.Linear(D, H); self.Ur = nn.Linear(H, H, bias=False)
-        self.Wh = nn.Linear(D, H); self.Uh = nn.Linear(H, H, bias=False)
-        self.out = nn.Linear(H, 1)
-        for m in [self.Wz, self.Wr, self.Wh, self.out]:
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    def forward_with_intermediates(self, x, return_intermediates=True):
-        B, T, _ = x.shape
-        h = torch.zeros(B, self.H, device=x.device)
-        ys = []
-        hs = []
-        if return_intermediates:
-            diagUz = torch.diagonal(self.Uz.weight, 0)
-            diagUr = torch.diagonal(self.Ur.weight, 0)
-            diagUh = torch.diagonal(self.Uh.weight, 0)
-            leaks, rdiags, rseq = [], [], []
-        for t in range(T):
-            h_prev = h
-            z = torch.sigmoid(self.Wz(x[:, t]) + self.Uz(h_prev))
-            r = torch.sigmoid(self.Wr(x[:, t]) + self.Ur(h_prev))
-            g = torch.tanh(self.Wh(x[:, t]) + self.Uh(r * h_prev))
-            h = (1.0 - z) * h_prev + z * g
-            ys.append(self.out(h))
-            hs.append(h)
-            if return_intermediates:
-                leak = torch.clamp(1.0 - z, 1e-12, 1.0)
-                zprime = z * (1.0 - z)
-                gprime = 1.0 - g ** 2
-                term1 = (g - h_prev) * zprime * diagUz.view(1, -1)
-                term2 = z * gprime * diagUh.view(1, -1) * r
-                term3 = z * gprime * diagUh.view(1, -1) * h_prev * (r * (1 - r)) * diagUr.view(1, -1)
-                leaks.append(leak)
-                rdiags.append(term1 + term2 + term3)
-                rseq.append(r)
-        y = torch.stack(ys, dim=1)
-        if not return_intermediates:
-            return y, None, None
-        return y, torch.stack(hs, dim=1), {"leak": torch.stack(leaks, dim=1),
-                                           "rdiag": torch.stack(rdiags, dim=1),
-                                           "r": torch.stack(rseq, dim=1)}
-
-    def neuron_param_indices(self, q):
-        idx = {}
-        for name in ["Wz", "Wr", "Wh"]:
-            idx[f"{name}.weight"] = list(range(q * self.D, (q + 1) * self.D))
-            idx[f"{name}.bias"] = [q]
-        for name in ["Uz", "Ur", "Uh"]:
-            idx[f"{name}.weight"] = list(range(q * self.H, (q + 1) * self.H))
-        return idx
-
-
-class LSTMCustom(BaseRNN):
-    def __init__(self, D: int, H: int):
-        super().__init__()
-        self.D, self.H = D, H
-        self.Wi = nn.Linear(D, H); self.Ui = nn.Linear(H, H, bias=False)
-        self.Wf = nn.Linear(D, H); self.Uf = nn.Linear(H, H, bias=False)
-        self.Wo = nn.Linear(D, H); self.Uo = nn.Linear(H, H, bias=False)
-        self.Wg = nn.Linear(D, H); self.Ug = nn.Linear(H, H, bias=False)
-        self.out = nn.Linear(H, 1)
-        for m in [self.Wi, self.Wf, self.Wo, self.Wg, self.out]:
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    def forward_with_intermediates(self, x, return_intermediates=True):
-        B, T, _ = x.shape
-        h = torch.zeros(B, self.H, device=x.device)
-        c = torch.zeros(B, self.H, device=x.device)
-        ys = []
-        hs = []
-        if return_intermediates:
-            diagUf = torch.diagonal(self.Uf.weight, 0)
-            diagUg = torch.diagonal(self.Ug.weight, 0)
-            diagUi = torch.diagonal(self.Ui.weight, 0)
-            leaks, rdiags, eseq = [], [], []
-        for t in range(T):
-            h_prev, c_prev = h, c
-            i = torch.sigmoid(self.Wi(x[:, t]) + self.Ui(h_prev))
-            f = torch.sigmoid(self.Wf(x[:, t]) + self.Uf(h_prev))
-            o = torch.sigmoid(self.Wo(x[:, t]) + self.Uo(h_prev))
-            g = torch.tanh(self.Wg(x[:, t]) + self.Ug(h_prev))
-            c = f * c_prev + i * g
-            tanh_c = torch.tanh(c)
-            h = o * tanh_c
-            ys.append(self.out(h))
-            hs.append(h)
-            if return_intermediates:
-                e = o * (1.0 - tanh_c ** 2)
-                leak = torch.clamp(f, 1e-12, 1.0)
-                diagC = (c_prev * (f * (1 - f))) * diagUf.view(1, -1) \
-                        + (i * (1 - g ** 2)) * diagUg.view(1, -1) \
-                        + (g * (i * (1 - i))) * diagUi.view(1, -1)
-                e_prev = torch.zeros_like(e) if t == 0 else eseq[-1]
-                rdiag_t = diagC * e_prev
-                eseq.append(e)
-                leaks.append(leak)
-                rdiags.append(rdiag_t)
-        y = torch.stack(ys, dim=1)
-        if not return_intermediates:
-            return y, None, None
-        return y, torch.stack(hs, dim=1), {"leak": torch.stack(leaks, dim=1),
-                                           "rdiag": torch.stack(rdiags, dim=1),
-                                           "e": torch.stack(eseq, dim=1)}
-
-    def neuron_param_indices(self, q):
-        idx = {}
-        for name in ["Wi", "Wf", "Wo", "Wg"]:
-            idx[f"{name}.weight"] = list(range(q * self.D, (q + 1) * self.D))
-            idx[f"{name}.bias"] = [q]
-        for name in ["Ui", "Uf", "Uo", "Ug"]:
-            idx[f"{name}.weight"] = list(range(q * self.H, (q + 1) * self.H))
-        return idx
-
-
 def build_model(arch: str, D: int, H: int, const_s: float = 0.005) -> BaseRNN:
+    """Build a model from the canonical models.py definitions."""
     arch = arch.lower()
     if arch == "const":
         return ConstGateRNN(D, H, s=const_s)
+    if arch == "shared":
+        return SharedGateRNN(D, H, init_s=const_s)
     if arch == "diag":
         return DiagGateRNN(D, H, init_s=const_s)
     if arch == "gru":
@@ -387,10 +169,6 @@ def build_model(arch: str, D: int, H: int, const_s: float = 0.005) -> BaseRNN:
         return LSTMCustom(D, H)
     raise ValueError(f"Unknown arch: {arch}")
 
-
-# ============================================================
-# Optimizer construction
-# ============================================================
 
 def build_optimizer(model: nn.Module, opt_name: str, lr: float = 1e-3) -> torch.optim.Optimizer:
     opt_name = opt_name.lower()
@@ -441,69 +219,37 @@ def train_model(model: BaseRNN, optimizer: torch.optim.Optimizer,
 
 
 # ============================================================
-# First-order diagonal expansion (prefix sums)
-# ============================================================
-
-@torch.no_grad()
-def precompute_prefix_sums(leak: torch.Tensor, rdiag: torch.Tensor):
-    """
-    leak:  (B, T, H) — positive gate-product factors
-    rdiag: (B, T, H) — first-order diagonal correction
-    Returns cs_log (B, T+1, H), cs_ratio (B, T+1, H).
-    """
-    B, T, H = leak.shape
-    device = leak.device
-    leak64 = torch.clamp(leak.double(), 1e-12, 1.0)
-    log_leak = torch.log(leak64)
-    cs_log = torch.zeros(B, T + 1, H, dtype=torch.float64, device=device)
-    cs_log[:, 1:, :] = torch.cumsum(log_leak, dim=1)
-    ratio = (rdiag.double() / leak64)
-    cs_ratio = torch.zeros(B, T + 1, H, dtype=torch.float64, device=device)
-    cs_ratio[:, 1:, :] = torch.cumsum(ratio, dim=1)
-    return cs_log, cs_ratio
-
-
-@torch.no_grad()
-def mu_diag_product_first_order(cs_log, cs_ratio, leak, rdiag, ell, out_dtype):
-    """
-    First-order diagonal expansion:
-      mu_tl = mu0 + mu1,  mu0 = prod(leak), mu1 = mu0 * sum(rdiag/leak)
-    Returns (B, T-ell+1, H).
-    """
-    B, Tp1, H = cs_log.shape
-    T = Tp1 - 1
-    if ell <= 0 or ell > T:
-        return torch.zeros(B, 0, H, dtype=out_dtype, device=cs_log.device)
-    if ell == 1:
-        return (leak + rdiag).to(out_dtype)
-    log_prod = cs_log[:, ell:(T + 1), :] - cs_log[:, 0:(T - ell + 1), :]
-    mu0_64 = torch.exp(log_prod)
-    sum_ratio = cs_ratio[:, ell:(T + 1), :] - cs_ratio[:, 0:(T - ell + 1), :]
-    mu1_64 = mu0_64 * sum_ratio
-    return (mu0_64 + mu1_64).to(out_dtype)
-
-
-# ============================================================
 # Envelope and per-neuron rate computation
+#
+# Uses the canonical transport functions from transport.py.
+# mu_diag_product_first_order now returns (mu0, mu1, mu_tl);
+# we use mu_tl (the combined term) for envelope magnitude.
 # ============================================================
 
 @torch.no_grad()
 def compute_per_neuron_envelope(model: BaseRNN, X: torch.Tensor,
                                 device: torch.device,
                                 lags: np.ndarray,
-                                batch_size: int = 32) -> np.ndarray:
+                                batch_size: int = 32
+                                ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute per-neuron, per-lag mean |mu^(q)_{t,ell}|.
+    Compute per-neuron, per-lag envelope statistics.
 
-    Returns f_q: (n_lags, H) array where f_q[j, q] = E_{seq,t} |mu^(q)_{t, lags[j]}|.
-    This uses the first-order diagonal expansion and multiplies by global lr=1
-    (transport factor only — caller handles the Λ weighting).
+    Returns:
+        f_q:     (n_lags, H)  E_{seq,t}[|μ^(q)_{t,ℓ}|]
+        log_f_q: (n_lags, H)  E_{seq,t}[log|μ^(q)_{t,ℓ}|]
+
+    The log-space accumulation (log_f_q) matches the theoretical definition
+    of μ̄_q = -lim (1/ℓ) E_t[log|μ^(q)|] and should be used for τ extraction.
+    The linear-space version (f_q) is kept for mixture construction and
+    other diagnostics that need E[|μ|] directly.
     """
     model.eval()
     lags = np.asarray(lags, dtype=int)
     Nseq = X.shape[0]
     H_model = None
     sum_f = None
+    sum_log_f = None
     n_seq = 0
 
     for i in range(0, Nseq, batch_size):
@@ -514,18 +260,26 @@ def compute_per_neuron_envelope(model: BaseRNN, X: torch.Tensor,
         if H_model is None:
             H_model = leak.shape[-1]
             sum_f = np.zeros((len(lags), H_model), dtype=np.float64)
+            sum_log_f = np.zeros((len(lags), H_model), dtype=np.float64)
         cs_log, cs_ratio = precompute_prefix_sums(leak, rdiag)
         for j, ell in enumerate(lags):
-            mu_tl = mu_diag_product_first_order(
+            # mu_diag_product_first_order returns (mu0, mu1, mu_tl)
+            _mu0, _mu1, mu_tl = mu_diag_product_first_order(
                 cs_log, cs_ratio, leak, rdiag, int(ell), leak.dtype)
             if mu_tl.numel() == 0:
                 continue
-            # |mu^(q)| averaged over start times → (B, H)
-            abs_mu_bh = torch.abs(mu_tl).double().mean(dim=1)
+            abs_mu = torch.abs(mu_tl).double()
+            # E_t[|μ^(q)|] per sequence: (B, H)
+            abs_mu_bh = abs_mu.mean(dim=1)
             sum_f[j] += abs_mu_bh.sum(dim=0).cpu().numpy()
+            # E_t[log|μ^(q)|] per sequence: (B, H)
+            log_abs_mu_bh = torch.log(abs_mu.clamp(min=1e-30)).mean(dim=1)
+            sum_log_f[j] += log_abs_mu_bh.sum(dim=0).cpu().numpy()
         n_seq += xb.shape[0]
 
-    return sum_f / max(n_seq, 1)  # (n_lags, H)
+    f_q = sum_f / max(n_seq, 1)          # (n_lags, H)
+    log_f_q = sum_log_f / max(n_seq, 1)  # (n_lags, H)
+    return f_q, log_f_q
 
 
 @torch.no_grad()
@@ -542,15 +296,25 @@ def compute_aggregate_envelope(f_q: np.ndarray) -> np.ndarray:
 # ============================================================
 
 def extract_tau_spectrum(f_q: np.ndarray, lags: np.ndarray,
-                         fit_lag_min: int = 20) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                         fit_lag_min: int = 20,
+                         log_f_q: Optional[np.ndarray] = None,
+                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    For each neuron q, fit log|f_q(ell)| ~ a_q - mu_bar_q * ell
-    over lags >= fit_lag_min.
+    For each neuron q, fit  E[log|μ^(q)|](ℓ) ~ a_q - μ̄_q * ℓ
+    over lags >= fit_lag_min, matching the theoretical definition of μ̄_q.
+
+    Args:
+      f_q:     (n_lags, H) — E_{seq,t}[|μ^(q)_{t,ℓ}|], used as fallback
+      lags:    (n_lags,) lag values
+      fit_lag_min: minimum lag for the fit window
+      log_f_q: (n_lags, H) — E_{seq,t}[log|μ^(q)_{t,ℓ}|], the theory-matched
+               observable.  If provided, the fit uses this directly.
+               If None, falls back to log(f_q) (the old behavior).
 
     Returns:
-      tau:   (H,)  — time scale 1/mu_bar_q
-      r2:    (H,)  — R^2 of the linear fit
-      mu_bar:(H,)  — asymptotic decay rate
+      tau:   (H,)  — time scale 1/μ̄_q  (NaN for invalid fits)
+      r2:    (H,)  — R² of the linear fit
+      mu_bar:(H,)  — asymptotic decay rate (NaN for invalid fits)
     """
     lags = np.asarray(lags, dtype=float)
     n_lags, H = f_q.shape
@@ -569,20 +333,31 @@ def extract_tau_spectrum(f_q: np.ndarray, lags: np.ndarray,
     mu_bar = np.full(H, np.nan)
 
     for q in range(H):
-        y = np.log(f_q[mask, q] + 1e-30)
+        if log_f_q is not None:
+            # Theory-matched: use pre-accumulated E[log|μ|]
+            y = log_f_q[mask, q]
+        else:
+            # Fallback: log(E[|μ|])
+            y = np.log(f_q[mask, q] + 1e-30)
         finite = np.isfinite(y)
         if finite.sum() < 4:
             continue
         coeff, _, _, _ = np.linalg.lstsq(A[finite], y[finite], rcond=None)
         b_q = float(coeff[1])
-        mu_q = max(1e-12, -b_q)
-        mu_bar[q] = mu_q
-        tau[q] = 1.0 / mu_q
 
         yhat = A[finite] @ coeff
         ss_res = np.sum((y[finite] - yhat) ** 2)
         ss_tot = np.sum((y[finite] - y[finite].mean()) ** 2) + 1e-12
         r2[q] = 1.0 - ss_res / ss_tot
+
+        if b_q >= 0:
+            # Non-negative slope: envelope is flat or growing, not decaying.
+            # Mark as invalid (NaN) rather than manufacturing a spurious
+            # giant τ by clamping to 1e-12.
+            continue
+
+        mu_bar[q] = -b_q
+        tau[q] = 1.0 / (-b_q)
 
     return tau, r2, mu_bar
 
@@ -661,7 +436,6 @@ def compute_gelr_mixture_envelope(model: BaseRNN,
 
     Btot, T_full, _ = X.shape
     bs = int(batch_size)
-    nb = max(1, math.ceil(Btot / bs))
 
     sum_mix = np.zeros(len(lags), dtype=np.float64)
     sum_lambda_mean = np.zeros(len(lags), dtype=np.float64)
@@ -719,102 +493,6 @@ def compute_gelr_mixture_envelope(model: BaseRNN,
         "used_lag_dependent_rates": bool(use_lag_dependent),
         "recurrent_matrices": list(lambda_meta.get("recurrent_matrices", [])),
     }
-
-
-# ============================================================
-# Approximate per-neuron Lambda from optimizer state (GELR)
-# ============================================================
-
-def compute_approx_lambda(model: BaseRNN, optimizer: torch.optim.Optimizer,
-                          H: int) -> Optional[np.ndarray]:
-    """
-    Compute approximate per-neuron Rayleigh projection Lambda^(q)
-    from the optimizer's second-moment state.
-
-    For Adam/RMSprop: Lambda^(q) ≈ mean of lr / (sqrt(v_entry) + eps)
-    over all parameter entries belonging to neuron q.
-    For SGD: returns None (Lambda = lr for all neurons).
-
-    Returns: (H,) array of approximate Lambda^(q), or None for SGD.
-    """
-    opt_state = optimizer.state
-    opt_defaults = optimizer.defaults
-
-    # Check optimizer type
-    is_adam = isinstance(optimizer, torch.optim.Adam)
-    is_rmsprop = isinstance(optimizer, torch.optim.RMSprop)
-    if not (is_adam or is_rmsprop):
-        return None
-
-    lr = opt_defaults["lr"]
-    eps = opt_defaults.get("eps", 1e-8)
-
-    # For Adam, get beta2 and step for bias correction
-    beta2 = opt_defaults.get("betas", (0.9, 0.999))[1] if is_adam else None
-
-    lambda_q = np.zeros(H, dtype=np.float64)
-    count_q = np.zeros(H, dtype=np.float64)
-
-    # Build param name -> param mapping
-    param_name_map = {id(p): name for name, p in model.named_parameters()}
-
-    for group in optimizer.param_groups:
-        group_lr = group.get("lr", lr)
-        group_eps = group.get("eps", eps)
-        group_beta2 = group.get("betas", (0.9, 0.999))[1] if is_adam else None
-
-        for p in group["params"]:
-            if p not in opt_state or not p.requires_grad:
-                continue
-
-            state = opt_state[p]
-            pname = param_name_map.get(id(p), None)
-            if pname is None:
-                continue
-
-            # Get second moment estimate
-            if is_adam and "exp_avg_sq" in state:
-                v = state["exp_avg_sq"].detach().cpu().numpy().flatten()
-                step = state.get("step", 1)
-                if isinstance(step, torch.Tensor):
-                    step = step.item()
-                # Bias correction
-                bc = 1.0 - group_beta2 ** step
-                v_corrected = v / max(bc, 1e-12)
-                eff_rates = group_lr / (np.sqrt(v_corrected) + group_eps)
-            elif is_rmsprop and "square_avg" in state:
-                v = state["square_avg"].detach().cpu().numpy().flatten()
-                eff_rates = group_lr / (np.sqrt(v) + group_eps)
-            else:
-                continue
-
-            # Map parameter entries to neurons
-            # Weight matrices: shape (out_features, in_features)
-            # Row q -> neuron q
-            p_shape = tuple(p.shape)
-            if pname.endswith(".weight") and len(p_shape) == 2:
-                out_f, in_f = p_shape
-                if out_f == H:
-                    # Row q belongs to neuron q
-                    eff_rates_2d = eff_rates.reshape(out_f, in_f)
-                    for q in range(H):
-                        lambda_q[q] += eff_rates_2d[q].sum()
-                        count_q[q] += in_f
-                elif out_f == 1 and in_f == H:
-                    # Output layer: column q -> neuron q
-                    for q in range(H):
-                        lambda_q[q] += eff_rates[q]
-                        count_q[q] += 1
-            elif pname.endswith(".bias") and len(p_shape) == 1:
-                if p_shape[0] == H:
-                    for q in range(H):
-                        lambda_q[q] += eff_rates[q]
-                        count_q[q] += 1
-
-    # Average
-    count_q = np.maximum(count_q, 1)
-    lambda_q = lambda_q / count_q
-    return lambda_q
 
 
 # ============================================================

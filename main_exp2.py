@@ -45,8 +45,16 @@ from seed_utils import (
     load_phase_trajectory_csv, load_learning_curve_csv,
     aggregate_trajectories as _su_aggregate_trajectories,
     aggregate_learning_curves as _su_aggregate_learning_curves,
+    aggregate_numeric_csvs,
+    aggregate_envelope_fit_jsons,
+    aggregate_gelr_fit_jsons,
+    aggregate_final_phase_jsons,
     find_file_in_seed_dir,
+    write_json,
+    _consensus_label,
+    _nanmean_no_warn,
 )
+from diagnostics import localize_threshold_bracket
 
 # ============================================================
 # Utilities
@@ -206,7 +214,7 @@ def aggregate_trajectories_for_condition(seed_dirs: List[str], model_name: str,
             for j, key_val in enumerate(idx):
                 if np.isfinite(key_val) and int(key_val) in pos and j < aux.size and np.isfinite(aux[j]):
                     aux_mat[si, pos[int(key_val)]] = aux[j]
-        aux_mean = np.nanmean(aux_mat, axis=0)
+        aux_mean, _ = _nanmean_no_warn(aux_mat)
         agg[aux_col] = np.rint(aux_mean).astype(int) if np.all(np.isfinite(aux_mean)) else aux_mean
 
     for col in NUMERIC_COLS:
@@ -219,18 +227,26 @@ def aggregate_trajectories_for_condition(seed_dirs: List[str], model_name: str,
                 if np.isfinite(key_val) and int(key_val) in pos and j < vals.size:
                     col_values[si, pos[int(key_val)]] = vals[j]
 
-        agg[f"{col}_mean"] = np.nanmean(col_values, axis=0).tolist()
-        agg[f"{col}_se"] = (np.nanstd(col_values, axis=0) / np.sqrt(n_seeds)).tolist()
+        col_mean, col_se = _nanmean_no_warn(col_values)
+        agg[f"{col}_mean"] = col_mean.tolist()
+        agg[f"{col}_se"] = col_se.tolist()
 
-    # Propagate string columns from first seed
+    # Keep string fields only when they agree across seeds; otherwise mark mixed.
     for col in STRING_COLS:
         vals = [""] * n_points
-        idx = np.asarray(data_per_seed[0].get(index_col, []), dtype=float)
-        str_vals = data_per_seed[0].get(col, [""] * len(idx))
         pos = {int(v): i for i, v in enumerate(index_values)}
-        for j, key_val in enumerate(idx):
-            if np.isfinite(key_val) and int(key_val) in pos and j < len(str_vals):
-                vals[pos[int(key_val)]] = str(str_vals[j])
+        for key_val in index_values:
+            labels = []
+            for seed_data in data_per_seed:
+                idx = np.asarray(seed_data.get(index_col, []), dtype=float)
+                str_vals = seed_data.get(col, [""] * len(idx))
+                for j, idx_val in enumerate(idx):
+                    if np.isfinite(idx_val) and int(idx_val) == int(key_val) and j < len(str_vals):
+                        value = str(str_vals[j]).strip()
+                        if value:
+                            labels.append(value)
+                        break
+            vals[pos[int(key_val)]] = _consensus_label(labels)["label"]
         agg[col] = vals
 
     return agg
@@ -290,7 +306,7 @@ def aggregate_learning_curves_for_condition(seed_dirs: List[str], model_name: st
             for j, key_val in enumerate(idx):
                 if np.isfinite(key_val) and int(key_val) in pos and j < aux.size and np.isfinite(aux[j]):
                     aux_mat[si, pos[int(key_val)]] = aux[j]
-        aux_mean = np.nanmean(aux_mat, axis=0)
+        aux_mean, _ = _nanmean_no_warn(aux_mat)
         agg[aux_col] = np.rint(aux_mean).astype(int) if np.all(np.isfinite(aux_mean)) else aux_mean
 
     train_loss_vals = np.full((n_seeds, n_points), np.nan, dtype=float)
@@ -302,10 +318,61 @@ def aggregate_learning_curves_for_condition(seed_dirs: List[str], model_name: st
             if np.isfinite(key_val) and int(key_val) in pos and j < vals.size:
                 train_loss_vals[si, pos[int(key_val)]] = vals[j]
 
-    agg["train_loss_mean"] = np.nanmean(train_loss_vals, axis=0).tolist()
-    agg["train_loss_se"] = (np.nanstd(train_loss_vals, axis=0) / np.sqrt(n_seeds)).tolist()
+    loss_mean, loss_se = _nanmean_no_warn(train_loss_vals)
+    agg["train_loss_mean"] = loss_mean.tolist()
+    agg["train_loss_se"] = loss_se.tolist()
 
     return agg
+
+
+def aggregate_final_artifacts_for_condition(seed_dirs: List[str], model_name: str,
+                                            condition_name: str, condition_value: str,
+                                            outdir: str):
+    """
+    Aggregate final-only artifacts across seeds for a single ablation condition.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    cond_dir = _condition_dir_name(condition_name, condition_value)
+
+    csv_specs = [
+        ("_envelope.csv", ["ell"]),
+        ("_envelope_fit_curves.csv", ["ell"]),
+        ("_adaptive_base_rates.csv", ["neuron_q"]),
+        ("_gelr_envelope_compare.csv", ["ell"]),
+        ("_gelr_fit_curves.csv", ["ell"]),
+    ]
+    json_specs = [
+        ("_envelope_fit.json", aggregate_envelope_fit_jsons),
+        ("_gelr_fit.json", aggregate_gelr_fit_jsons),
+        ("_final_phase.json", aggregate_final_phase_jsons),
+    ]
+
+    for suffix, key_cols in csv_specs:
+        dst = os.path.join(outdir, f"{model_name}{suffix}")
+        paths = []
+        for seed_dir in seed_dirs:
+            src = os.path.join(seed_dir, model_name, cond_dir, f"{model_name}{suffix}")
+            if os.path.exists(src):
+                paths.append(src)
+        agg = aggregate_numeric_csvs(paths, key_cols)
+        if agg is not None:
+            header, rows = agg
+            write_csv(dst, header, rows)
+        elif os.path.exists(dst):
+            os.remove(dst)
+
+    for suffix, agg_fn in json_specs:
+        dst = os.path.join(outdir, f"{model_name}{suffix}")
+        paths = []
+        for seed_dir in seed_dirs:
+            src = os.path.join(seed_dir, model_name, cond_dir, f"{model_name}{suffix}")
+            if os.path.exists(src):
+                paths.append(src)
+        agg = agg_fn(paths)
+        if agg is not None:
+            write_json(dst, agg)
+        elif os.path.exists(dst):
+            os.remove(dst)
 
 
 def save_aggregated_trajectory(agg: Dict, outpath: str):
@@ -337,24 +404,36 @@ def create_aggregated_phase_trajectory(agg: Dict, outpath: str):
     """
     Write a standard phase_trajectory.csv from aggregated means so the
     existing plotting scripts can consume it directly.
+
+    Each data row is built by iterating PHASE_TRAJ_COLS in order and
+    dispatching by column type, so the data row matches the header
+    position-for-position. Earlier versions wrote epoch, step, all
+    NUMERIC_COLS, then all STRING_COLS, which permuted the
+    {alpha_method, n_samples, beta_env, beta_env_r2} block relative
+    to the interleaved header order in PHASE_TRAJ_COLS and produced
+    column-shifted aggregated CSVs (e.g.\\ string ``ecf'' landing in
+    the beta_env_r2 column).
     """
     if not agg or "epoch" not in agg:
         return
     epochs = agg["epoch"]
-    # Include string columns in header too
+    n = len(epochs)
     header = list(PHASE_TRAJ_COLS)
     rows = []
-    for i in range(len(epochs)):
-        step_val = agg["step"][i] if "step" in agg else np.nan
-        row = [
-            int(round(epochs[i])) if np.isfinite(epochs[i]) else "",
-            int(round(step_val)) if np.isfinite(step_val) else "",
-        ]
-        for col in NUMERIC_COLS:
-            row.append(float(agg.get(f"{col}_mean", agg.get(col, np.full(len(epochs), np.nan)))[i]))
-        for col in STRING_COLS:
-            vals = agg.get(col, [""] * len(epochs))
-            row.append(str(vals[i]) if i < len(vals) else "")
+    for i in range(n):
+        row = []
+        for col in PHASE_TRAJ_COLS:
+            if col == "epoch":
+                row.append(int(round(epochs[i])) if np.isfinite(epochs[i]) else "")
+            elif col == "step":
+                step_val = agg["step"][i] if "step" in agg else np.nan
+                row.append(int(round(step_val)) if np.isfinite(step_val) else "")
+            elif col in STRING_COLS:
+                vals = agg.get(col, [""] * n)
+                row.append(str(vals[i]) if i < len(vals) else "")
+            else:
+                vals = agg.get(f"{col}_mean", agg.get(col, np.full(n, np.nan)))
+                row.append(float(vals[i]))
         rows.append(row)
 
     write_csv(outpath, header, rows)
@@ -533,6 +612,14 @@ def parse_args():
     p.add_argument("--tau_ccdf_qmin", type=float, default=0.75)
     p.add_argument("--tau_ccdf_qmax", type=float, default=0.995)
 
+    # bootstrap + phase classification
+    p.add_argument("--beta_bootstrap_B", type=int, default=2000,
+                   help="Number of bootstrap resamples for beta uncertainty (default: 2000)")
+    p.add_argument("--beta_bootstrap_ci", type=float, default=0.90,
+                   help="Confidence level for bootstrap stability interval (default: 0.90)")
+    p.add_argument("--phase_r2_threshold", type=float, default=0.90,
+                   help="Tail-fit R^2 threshold for phase classification (default: 0.90)")
+
     # envelope + ccdf saves
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
     p.add_argument("--save_final_envelope", action="store_true")
@@ -590,6 +677,9 @@ def build_common_args(args) -> Dict:
         "lag_min": args.lag_min,
         "lag_max": args.lag_max,
         "num_lags": args.num_lags,
+        "beta_bootstrap_B": args.beta_bootstrap_B,
+        "beta_bootstrap_ci": args.beta_bootstrap_ci,
+        "phase_r2_threshold": args.phase_r2_threshold,
         "device": args.device,
         # warm-start
         "warmup_epochs": args.warmup_epochs,
@@ -735,23 +825,19 @@ def main():
             save_aggregated_learning_curve(lc_agg, os.path.join(cdir, "learning_curve_aggregated.csv"))
 
     # ================================================================
-    # STEP 2c: Copy per-seed checkpoint data into aggregated dir
+    # STEP 2c: Copy raw checkpoint artifacts + aggregate final-only outputs
     # ================================================================
-    # For final-checkpoint plots (histograms, CCDFs, alpha stable-fit), we copy data
-    # from the last seed. Existing data is REMOVED first to avoid stale artifacts.
-    log("Copying last-seed checkpoint data into aggregated dir ...")
+    # Raw checkpoint directories are copied from one exemplar seed for audit plots.
+    # Final envelope / phase artifacts are aggregated across seeds below.
+    log("Copying exemplar checkpoint data and aggregating final artifacts ...")
     last_seed_dir = seed_dirs[-1] if seed_dirs else None
     if last_seed_dir:
-        CHECKPOINT_DIRS = ["checkpoint_alpha", "checkpoint_taus", "checkpoint_tau_ccdf", "checkpoint_tau_tail"]
-        FILE_SUFFIXES = [
-            "_envelope.csv",
-            "_envelope_fit.json",
-            "_envelope_fit_curves.csv",
-            "_adaptive_base_rates.csv",
-            "_gelr_envelope_compare.csv",
-            "_gelr_fit.json",
-            "_gelr_fit_curves.csv",
-            "_learning_curve.csv",
+        CHECKPOINT_DIRS = [
+            "checkpoint_alpha",
+            "checkpoint_taus",
+            "checkpoint_tau_ccdf",
+            "checkpoint_tau_tail",
+            "checkpoint_beta_bootstrap",
         ]
 
         for model_name in models:
@@ -769,17 +855,18 @@ def main():
                 for ckpt_name in CHECKPOINT_DIRS:
                     src = os.path.join(src_model_cond_dir, ckpt_name)
                     dst = os.path.join(cdir_agg, ckpt_name)
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
                     if os.path.isdir(src):
-                        if os.path.exists(dst):
-                            shutil.rmtree(dst)
                         shutil.copytree(src, dst)
 
-                # Copy single files (overwrite stale)
-                for suffix in FILE_SUFFIXES:
-                    src_f = os.path.join(src_model_cond_dir, f"{model_name}{suffix}")
-                    dst_f = os.path.join(cdir_agg, f"{model_name}{suffix}")
-                    if os.path.exists(src_f):
-                        shutil.copy2(src_f, dst_f)
+                aggregate_final_artifacts_for_condition(
+                    seed_dirs,
+                    model_name,
+                    cond_name,
+                    cond_value,
+                    cdir_agg,
+                )
 
     # ================================================================
     # STEP 2d: Summary table (final-epoch diagnostics per condition)
@@ -787,6 +874,8 @@ def main():
     log("Generating summary table (final-epoch diagnostics) ...")
     summary_cols = ["model", "condition", "warmup_epochs", "n_seeds",
                     "beta_hat_mean", "beta_hat_se",
+                    "beta_median_mean", "beta_median_se",
+                    "p_beta_lt1_mean", "p_beta_lt1_se",
                     "beta_env_mean", "beta_env_se",
                     "alpha_hat_mean", "alpha_hat_se",
                     "tau_mean_mean", "tau_mean_se"]
@@ -800,7 +889,7 @@ def main():
             n_s = agg.get("n_seeds", 0)
             cond_label = f"{cond_name}_{cond_value}"
             row = [model_name, cond_label, args.warmup_epochs, n_s]
-            for col in ["beta_hat", "beta_env", "alpha_hat", "tau_mean"]:
+            for col in ["beta_hat", "beta_median", "p_beta_lt1", "beta_env", "alpha_hat", "tau_mean"]:
                 m_key = f"{col}_mean"
                 se_key = f"{col}_se"
                 if m_key in agg and len(agg[m_key]) > 0:
@@ -816,15 +905,100 @@ def main():
     log(f"  Summary table saved to {summary_path}")
 
     # Print summary to stdout
-    log(f"  {'Model':<12} {'Condition':<30} {'warmup':>6} {'n':>4}  {'beta_hat':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}")
-    log(f"  {'-'*12} {'-'*30} {'-'*6} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}")
+    log(f"  {'Model':<12} {'Condition':<30} {'warmup':>6} {'n':>4}  {'beta_hat':>8}  {'b_med':>8}  {'P(b<1)':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}")
+    log(f"  {'-'*12} {'-'*30} {'-'*6} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}")
     for r in summary_rows:
         model_name, cond_label, wu, n_s = r[0], r[1], r[2], r[3]
         bh_m, bh_se = r[4], r[5]
-        be_m, be_se = r[6], r[7]
-        ah_m, ah_se = r[8], r[9]
-        tm_m, tm_se = r[10], r[11]
-        log(f"  {model_name:<12} {cond_label:<30} {wu:>6} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}")
+        bmed_m, bmed_se = r[6], r[7]
+        pbl_m, pbl_se = r[8], r[9]
+        be_m, be_se = r[10], r[11]
+        ah_m, ah_se = r[12], r[13]
+        tm_m, tm_se = r[14], r[15]
+        log(f"  {model_name:<12} {cond_label:<30} {wu:>6} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {bmed_m:>5.2f}+/-{bmed_se:.2f}  {pbl_m:>5.2f}+/-{pbl_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}")
+
+    # ================================================================
+    # STEP 2e: Threshold localization in intervention space
+    # ================================================================
+    log("Localizing threshold brackets in intervention space ...")
+
+    # Group conditions by ablation type
+    ablation_types = {}
+    for cond_name, cond_value in cond_ablation_grid:
+        if cond_name == "baseline":
+            continue
+        ablation_types.setdefault(cond_name, []).append(cond_value)
+
+    # For batch_ablation, higher value = stronger suppression
+    # For clip_ablation, lower value = stronger suppression
+    # For winsorize_ablation, lower value = stronger suppression
+    higher_means_stronger_map = {
+        "batch_ablation": True,
+        "clip_ablation": False,
+        "winsorize_ablation": False,
+    }
+
+    threshold_brackets = {}
+    for model_name in models:
+        threshold_brackets[model_name] = {}
+        for abl_type, abl_values in ablation_types.items():
+            # Collect final phase labels per ablation value
+            condition_results = []
+            for val in abl_values:
+                # Read final phase from aggregated or seed-level results
+                cond_dir_name = _condition_dir_name(abl_type, val)
+                final_phase_path = os.path.join(
+                    agg_dir, model_name, cond_dir_name,
+                    f"{model_name}_final_phase.json"
+                )
+                if os.path.isfile(final_phase_path):
+                    with open(final_phase_path) as f:
+                        fp = json.load(f)
+                    phase_label = fp.get("phase_label", "")
+                    majority_phase_label = fp.get("majority_phase_label", "")
+                    phase_majority_fraction = fp.get("phase_majority_fraction")
+                else:
+                    # Fall back to last checkpoint label from aggregated trajectory
+                    agg = aggregate_trajectories_for_condition(
+                        seed_dirs, model_name, abl_type, val
+                    )
+                    if agg and "phase_label" in agg and len(agg["phase_label"]) > 0:
+                        phase_label = agg["phase_label"][-1]
+                    else:
+                        phase_label = ""
+                    majority_phase_label = ""
+                    phase_majority_fraction = None
+                condition_results.append({
+                    "condition_value": float(val),
+                    "phase_label": phase_label,
+                    "majority_phase_label": majority_phase_label,
+                    "phase_majority_fraction": phase_majority_fraction,
+                })
+
+            bracket = localize_threshold_bracket(
+                condition_results,
+                intervention_key="condition_value",
+                phase_key="phase_label",
+                higher_means_stronger=higher_means_stronger_map.get(abl_type, True),
+            )
+            threshold_brackets[model_name][abl_type] = bracket
+
+            if bracket["bracket_found"]:
+                majority_note = " [strict majority]" if bracket.get("used_majority_vote") else ""
+                log(f"  {model_name}/{abl_type}: bracket found{majority_note} — "
+                    f"last AC at {bracket['last_anti_collapsed']}, "
+                    f"first collapsed at {bracket['first_collapsed']}, "
+                    f"width={bracket['bracket_width']:.4g}")
+            else:
+                majority_note = " [strict majority]" if bracket.get("used_majority_vote") else ""
+                log(f"  {model_name}/{abl_type}: no full bracket{majority_note} — "
+                    f"status={bracket.get('status', 'unknown')}")
+
+    # Save threshold brackets
+    brackets_path = os.path.join(agg_dir, "threshold_brackets.json")
+    with open(brackets_path, "w") as f:
+        json.dump(threshold_brackets, f, indent=2, default=str)
+    log(f"  Threshold brackets saved to {brackets_path}")
 
     # ================================================================
     # STEP 3: Plot (multi-seed aware)

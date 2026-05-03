@@ -407,24 +407,34 @@ def aggregate_moment_rows(moment_rows):
         q10_vals = np.array([row["zeta_q10"] for row in subset], dtype=np.float64)
         q90_vals = np.array([row["zeta_q90"] for row in subset], dtype=np.float64)
 
+        def _finite(values):
+            return values[np.isfinite(values)]
+
+        def _finite_mean(values):
+            finite = _finite(values)
+            if finite.size == 0:
+                return float("nan")
+            return float(np.mean(finite))
+
         def _se(values):
+            values = _finite(values)
             n = int(np.count_nonzero(np.isfinite(values)))
             if n <= 1:
                 return 0.0
-            return float(np.nanstd(values, ddof=1) / math.sqrt(n))
+            return float(np.std(values, ddof=1) / math.sqrt(n))
 
         aggregated.append({
             "epoch": int(epoch),
             "n_runs": int(len(subset)),
             "n_late_runs": int(sum(int(row["is_late"]) for row in subset)),
-            "zeta_mean_mean": float(np.nanmean(mean_vals)),
+            "zeta_mean_mean": _finite_mean(mean_vals),
             "zeta_mean_se": _se(mean_vals),
-            "zeta_var_mean": float(np.nanmean(var_vals)),
+            "zeta_var_mean": _finite_mean(var_vals),
             "zeta_var_se": _se(var_vals),
-            "zeta_median_mean": float(np.nanmean(med_vals)),
+            "zeta_median_mean": _finite_mean(med_vals),
             "zeta_median_se": _se(med_vals),
-            "zeta_q10_mean": float(np.nanmean(q10_vals)),
-            "zeta_q90_mean": float(np.nanmean(q90_vals)),
+            "zeta_q10_mean": _finite_mean(q10_vals),
+            "zeta_q90_mean": _finite_mean(q90_vals),
         })
     return aggregated
 
@@ -434,7 +444,7 @@ def plot_conditional_drift(rows, bulk_center: float, display_name: str, outpath:
         return
 
     x = np.array([row["zeta_center"] for row in rows], dtype=np.float64)
-    y = np.array([row["delta_median"] for row in rows], dtype=np.float64)
+    y = np.array([row["delta_trimmed_mean"] for row in rows], dtype=np.float64)
     y_lo = np.array([row["delta_q25"] for row in rows], dtype=np.float64)
     y_hi = np.array([row["delta_q75"] for row in rows], dtype=np.float64)
 
@@ -445,15 +455,19 @@ def plot_conditional_drift(rows, bulk_center: float, display_name: str, outpath:
     y_hi = y_hi[order]
 
     plt.figure(figsize=(7.2, 4.6))
-    plt.fill_between(x, y_lo, y_hi, alpha=0.18, color="tab:blue", linewidth=0.0)
-    plt.plot(x, y, marker="o", linewidth=1.8, color="tab:blue")
+    plt.fill_between(x, y_lo, y_hi, alpha=0.18, color="tab:blue", linewidth=0.0,
+                     label=r"bin IQR of $\Delta\zeta$")
+    plt.plot(x, y, marker="o", linewidth=1.8, color="tab:blue",
+             label=r"$\hat F(\zeta)$ (trimmed mean)")
     plt.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
     if np.isfinite(bulk_center):
-        plt.axvline(bulk_center, color="tab:red", linestyle=":", linewidth=1.2)
+        plt.axvline(bulk_center, color="tab:red", linestyle=":", linewidth=1.2,
+                    label=r"bulk median $\tilde\zeta$")
     plt.xlabel(r"current $\zeta$")
-    plt.ylabel(r"median $\Delta \zeta / \Delta \mathrm{epoch}$")
+    plt.ylabel(r"$\hat F(\zeta)$")
     plt.title(f"Late-training conditional drift: {display_name}")
     plt.grid(True, alpha=0.25)
+    plt.legend(loc="best", fontsize=9, framealpha=0.9)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300, bbox_inches="tight")
     plt.close()
@@ -492,6 +506,294 @@ def plot_moments(moment_agg_rows, late_start_epoch: float, display_name: str, ou
     plt.close(fig)
 
 
+def _fit_constant_vs_linear(z: np.ndarray, d: np.ndarray):
+    """
+    Compare a constant model d ≈ c against a linear model d ≈ a + b*z
+    on the same data. Returns (rss_const, rss_linear, bic_const, bic_linear,
+    slope_linear).
+    """
+    z = np.asarray(z, dtype=np.float64)
+    d = np.asarray(d, dtype=np.float64)
+    mask = np.isfinite(z) & np.isfinite(d)
+    z = z[mask]; d = d[mask]
+    n = z.size
+    if n < 4:
+        nan = float("nan")
+        return nan, nan, nan, nan, nan
+    c_hat = float(np.mean(d))
+    resid_c = d - c_hat
+    rss_c = float(np.sum(resid_c * resid_c))
+
+    coeff = np.polyfit(z, d, deg=1)  # [slope, intercept]
+    slope = float(coeff[0]); intercept = float(coeff[1])
+    resid_l = d - (slope * z + intercept)
+    rss_l = float(np.sum(resid_l * resid_l))
+
+    # Gaussian-likelihood BIC with MLE σ²
+    def _bic(rss: float, k: int) -> float:
+        if not np.isfinite(rss) or rss <= 0.0 or n <= 0:
+            return float("nan")
+        sigma2 = rss / n
+        ll = -0.5 * n * (math.log(2.0 * math.pi * sigma2) + 1.0)
+        return float(k * math.log(n) - 2.0 * ll)
+
+    bic_c = _bic(rss_c, k=1)
+    bic_l = _bic(rss_l, k=2)
+    return rss_c, rss_l, bic_c, bic_l, slope
+
+
+def compute_tail_saturation_metrics(
+    transition_blocks,
+    q_low: float,
+    trim_fraction: float,
+    bootstrap_B: int,
+    ci_level: float,
+    rng_seed: int,
+):
+    """
+    Targeted empirical check of the far-left-tail closure F(ζ) = κ + o(1).
+
+    transition_blocks: list of (current_zeta_array, delta_array) tuples. Each
+        tuple is one late-training checkpoint transition; every entry of the
+        array corresponds to a recurrent unit, so each block is the natural
+        unit of dependence.
+
+    For each candidate q_low:
+      (a) plateau value κ̂_tail : trimmed mean of Δζ on {ζ ≤ quantile_{q_low}(ζ_pool)}
+      (b) slope of Δζ vs ζ inside the same slice
+      (c) constant-vs-linear model comparison (RSS, BIC) on the slice
+      (d) block-bootstrap CI over transition blocks
+
+    The point estimate uses the tail slice defined by the lower q_low-quantile
+    of the full pooled ζ. Each bootstrap iteration *re-estimates* the tail
+    quantile from its own resampled pool, so the resulting CI captures
+    uncertainty in where the slice starts as well as uncertainty in the
+    contents of the slice.
+
+    Returns a dict {q_low: {...metrics...}}.
+    """
+    blocks = [
+        (np.asarray(c, dtype=np.float64), np.asarray(d, dtype=np.float64))
+        for (c, d) in transition_blocks
+        if np.asarray(c).size > 0
+    ]
+    if not blocks:
+        return {}
+
+    # Pool for quantile selection only.
+    z_pool = np.concatenate([c for (c, _) in blocks])
+    d_pool = np.concatenate([d for (_, d) in blocks])
+    mask_pool = np.isfinite(z_pool) & np.isfinite(d_pool)
+    z_pool = z_pool[mask_pool]
+    d_pool = d_pool[mask_pool]
+    if z_pool.size == 0:
+        return {}
+
+    q_low = float(np.clip(q_low, 1e-4, 0.5))
+    tail_cut = float(np.quantile(z_pool, q_low))
+
+    tail_mask = z_pool <= tail_cut
+    n_tail_pool = int(np.count_nonzero(tail_mask))
+
+    if n_tail_pool < 200:
+        return {
+            "q_low": q_low,
+            "tail_zeta_cut": tail_cut,
+            "n_tail_samples": n_tail_pool,
+            "skipped": True,
+            "reason": f"insufficient tail samples ({n_tail_pool} < 200)",
+        }
+
+    z_tail = z_pool[tail_mask]
+    d_tail = d_pool[tail_mask]
+
+    kappa_tail = trimmed_mean(d_tail, trim_fraction)
+    rss_c, rss_l, bic_c, bic_l, slope_tail = _fit_constant_vs_linear(z_tail, d_tail)
+
+    # Block-bootstrap over transition blocks.
+    # On each resample we re-estimate the tail cutoff from the resampled
+    # pooled ζ, so the CI captures both (i) sampling variability in the
+    # slope / plateau given the slice, and (ii) uncertainty in where the
+    # slice starts. The point estimates above still use the full-data
+    # cutoff tail_cut.
+    rng = np.random.default_rng(rng_seed)
+    n_blocks = len(blocks)
+    B = int(bootstrap_B)
+    kappa_samples = np.empty(B, dtype=np.float64)
+    slope_samples = np.empty(B, dtype=np.float64)
+    delta_bic_samples = np.empty(B, dtype=np.float64)
+    tail_cut_samples = np.empty(B, dtype=np.float64)
+    n_tail_samples_boot = np.empty(B, dtype=np.float64)
+    for b in range(B):
+        idx = rng.integers(0, n_blocks, size=n_blocks)
+
+        # First pass: build the resampled pooled ζ so we can re-estimate
+        # the lower q_low-quantile on THIS bootstrap sample.
+        z_pool_blocks = []
+        d_pool_blocks = []
+        for i in idx:
+            c_i, d_i = blocks[i]
+            m = np.isfinite(c_i) & np.isfinite(d_i)
+            if not np.any(m):
+                continue
+            z_pool_blocks.append(c_i[m])
+            d_pool_blocks.append(d_i[m])
+        if not z_pool_blocks:
+            kappa_samples[b] = np.nan
+            slope_samples[b] = np.nan
+            delta_bic_samples[b] = np.nan
+            tail_cut_samples[b] = np.nan
+            n_tail_samples_boot[b] = 0.0
+            continue
+        z_pool_b = np.concatenate(z_pool_blocks)
+        d_pool_b = np.concatenate(d_pool_blocks)
+        if z_pool_b.size < 10:
+            kappa_samples[b] = np.nan
+            slope_samples[b] = np.nan
+            delta_bic_samples[b] = np.nan
+            tail_cut_samples[b] = np.nan
+            n_tail_samples_boot[b] = 0.0
+            continue
+
+        tail_cut_b = float(np.quantile(z_pool_b, q_low))
+        tail_cut_samples[b] = tail_cut_b
+
+        tm = z_pool_b <= tail_cut_b
+        z_b = z_pool_b[tm]
+        d_b = d_pool_b[tm]
+        n_tail_samples_boot[b] = float(z_b.size)
+
+        if z_b.size < 4:
+            kappa_samples[b] = np.nan
+            slope_samples[b] = np.nan
+            delta_bic_samples[b] = np.nan
+            continue
+        kappa_samples[b] = trimmed_mean(d_b, trim_fraction)
+        _, _, bic_c_b, bic_l_b, slope_b = _fit_constant_vs_linear(z_b, d_b)
+        slope_samples[b] = slope_b
+        delta_bic_samples[b] = (bic_l_b - bic_c_b)
+
+    alpha_ci = (1.0 - float(ci_level)) / 2.0
+    def _pct_ci(arr: np.ndarray):
+        valid = arr[np.isfinite(arr)]
+        if valid.size == 0:
+            return float("nan"), float("nan")
+        lo = float(np.quantile(valid, alpha_ci))
+        hi = float(np.quantile(valid, 1.0 - alpha_ci))
+        return lo, hi
+
+    kappa_lo, kappa_hi = _pct_ci(kappa_samples)
+    slope_lo, slope_hi = _pct_ci(slope_samples)
+    dbic_lo, dbic_hi = _pct_ci(delta_bic_samples)
+    tail_cut_lo, tail_cut_hi = _pct_ci(tail_cut_samples)
+
+    # Report the distribution of per-iteration tail cutoffs so the
+    # reader can see how stable the slice boundary is across resamples.
+    tail_cut_bs_mean = float(np.nanmean(tail_cut_samples)) if np.any(np.isfinite(tail_cut_samples)) else float("nan")
+    tail_cut_bs_median = float(np.nanmedian(tail_cut_samples)) if np.any(np.isfinite(tail_cut_samples)) else float("nan")
+    n_tail_bs_median = float(np.nanmedian(n_tail_samples_boot)) if np.any(np.isfinite(n_tail_samples_boot)) else float("nan")
+
+    # Decisions
+    positivity_pass = bool(np.isfinite(kappa_lo) and kappa_lo > 0.0)
+    flatness_pass = bool(
+        np.isfinite(slope_lo) and np.isfinite(slope_hi)
+        and slope_lo < 0.0 < slope_hi
+    )
+    # Prefer constant model if ΔBIC = BIC_linear - BIC_constant >= 0.
+    constant_preferred = bool(
+        np.isfinite(bic_c) and np.isfinite(bic_l) and (bic_l - bic_c) >= 0.0
+    )
+
+    return {
+        "q_low": q_low,
+        "tail_zeta_cut": tail_cut,
+        "tail_zeta_cut_ci_lo": tail_cut_lo,
+        "tail_zeta_cut_ci_hi": tail_cut_hi,
+        "tail_zeta_cut_bs_mean": tail_cut_bs_mean,
+        "tail_zeta_cut_bs_median": tail_cut_bs_median,
+        "n_tail_samples": n_tail_pool,
+        "n_tail_samples_bs_median": n_tail_bs_median,
+        "n_blocks": n_blocks,
+        "kappa_tail": kappa_tail,
+        "kappa_tail_ci_lo": kappa_lo,
+        "kappa_tail_ci_hi": kappa_hi,
+        "slope_tail": slope_tail,
+        "slope_tail_ci_lo": slope_lo,
+        "slope_tail_ci_hi": slope_hi,
+        "rss_constant": rss_c,
+        "rss_linear": rss_l,
+        "bic_constant": bic_c,
+        "bic_linear": bic_l,
+        "delta_bic_linear_minus_constant": (bic_l - bic_c) if np.isfinite(bic_c) and np.isfinite(bic_l) else float("nan"),
+        "delta_bic_ci_lo": dbic_lo,
+        "delta_bic_ci_hi": dbic_hi,
+        "positivity_pass": positivity_pass,
+        "flatness_pass": flatness_pass,
+        "constant_preferred": constant_preferred,
+        "bootstrap_B": B,
+        "ci_level": float(ci_level),
+        "trim_fraction": float(trim_fraction),
+        "skipped": False,
+    }
+
+
+def plot_combined_drift_with_tail(
+    drift_rows,
+    bulk_center: float,
+    tail_metrics_primary: dict,
+    display_name: str,
+    outpath: str,
+):
+    """
+    Overlay the binned conditional drift F̂(ζ) with a shaded tail slice
+    (ζ ≤ tail_zeta_cut) and a horizontal dashed line at κ̂_tail with its
+    bootstrap CI band.
+    """
+    if not drift_rows:
+        return
+    x = np.array([row["zeta_center"] for row in drift_rows], dtype=np.float64)
+    y = np.array([row["delta_trimmed_mean"] for row in drift_rows], dtype=np.float64)
+    y_lo = np.array([row["delta_q25"] for row in drift_rows], dtype=np.float64)
+    y_hi = np.array([row["delta_q75"] for row in drift_rows], dtype=np.float64)
+    order = np.argsort(x)
+    x = x[order]; y = y[order]; y_lo = y_lo[order]; y_hi = y_hi[order]
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    ax.fill_between(x, y_lo, y_hi, alpha=0.15, color="tab:blue", linewidth=0.0,
+                    label=r"bin IQR of $\Delta\zeta$")
+    ax.plot(x, y, marker="o", linewidth=1.8, color="tab:blue",
+            label=r"$\hat F(\zeta)$ (trimmed mean)")
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+    if np.isfinite(bulk_center):
+        ax.axvline(bulk_center, color="tab:red", linestyle=":", linewidth=1.2,
+                   label=r"bulk median $\tilde\zeta$")
+
+    if tail_metrics_primary and not tail_metrics_primary.get("skipped", True):
+        tail_cut = tail_metrics_primary["tail_zeta_cut"]
+        kappa = tail_metrics_primary["kappa_tail"]
+        klo = tail_metrics_primary["kappa_tail_ci_lo"]
+        khi = tail_metrics_primary["kappa_tail_ci_hi"]
+
+        x_left = float(min(np.min(x), tail_cut)) - 0.05 * (np.max(x) - np.min(x) + 1e-9)
+        ax.axvspan(x_left, tail_cut, color="tab:orange", alpha=0.12,
+                   label=r"tail slice $\zeta \leq \zeta_{q_{\mathrm{low}}}$")
+        ax.axvline(tail_cut, color="tab:orange", linestyle="--", linewidth=1.1)
+        ax.hlines(kappa, x_left, tail_cut, color="tab:orange", linestyle="-", linewidth=2.2,
+                  label=r"$\hat\kappa_{\mathrm{tail}}$")
+        if np.isfinite(klo) and np.isfinite(khi):
+            ax.fill_between([x_left, tail_cut], [klo, klo], [khi, khi],
+                            color="tab:orange", alpha=0.25, linewidth=0.0)
+
+    ax.set_xlabel(r"current $\zeta$")
+    ax.set_ylabel(r"$\hat F(\zeta)$")
+    ax.set_title(f"Far-tail closure diagnostic: {display_name}")
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="best", fontsize=8, framealpha=0.85)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", type=str, required=True,
@@ -517,6 +819,20 @@ def parse_args():
                         help="Quantile used to summarize left and right tail drift signs.")
     parser.add_argument("--tau_floor", type=float, default=1e-30,
                         help="Lower bound used before taking -log(tau).")
+
+    # Far-tail saturation diagnostic (targeted check of the F(ζ)=κ+o(1) closure)
+    parser.add_argument("--tail_q_low_primary", type=float, default=0.10,
+                        help="Primary lower quantile defining the far-tail slice {ζ ≤ quantile_{q_low}(ζ)}.")
+    parser.add_argument("--tail_q_low_sweep", type=str, default="0.05,0.10,0.15",
+                        help="Comma-separated sweep of q_low values for robustness.")
+    parser.add_argument("--tail_trim_fraction", type=float, default=0.1,
+                        help="Trim fraction used for the robust κ̂_tail estimate.")
+    parser.add_argument("--tail_bootstrap_B", type=int, default=2000,
+                        help="Number of block-bootstrap resamples for the far-tail CI.")
+    parser.add_argument("--tail_ci_level", type=float, default=0.90,
+                        help="Confidence level for the block-bootstrap CI on κ̂_tail and slope.")
+    parser.add_argument("--tail_bootstrap_seed", type=int, default=20260410,
+                        help="Seed for the block-bootstrap RNG (for reproducibility).")
     return parser.parse_args()
 
 
@@ -528,6 +844,16 @@ def main():
     display_name = infer_display_name(args.input_dir, args.model, runs)
 
     log(f"Found {len(runs)} run(s) for {display_name}")
+    low_n_runs_warning = None
+    if len(runs) < 3:
+        low_n_runs_warning = (
+            f"n_runs={len(runs)} < 3: the cross-run variance/SE estimates are "
+            f"unreliable, and the drift-closure validation figure should NOT "
+            f"be treated as publication-quality with this few seeds."
+        )
+        log("=" * 72)
+        log("WARNING: " + low_n_runs_warning)
+        log("=" * 72)
 
     manifest = {
         "input_dir": os.path.abspath(args.input_dir),
@@ -571,15 +897,25 @@ def main():
 
         for i, epoch in enumerate(epochs):
             zeta = zeta_matrix[i]
+            zeta_finite = zeta[np.isfinite(zeta)]
+            n_finite = int(zeta_finite.size)
+            if n_finite == 0:
+                z_mean = z_var = z_med = z_q10 = z_q90 = float("nan")
+            else:
+                z_mean = float(np.mean(zeta_finite))
+                z_var = float(np.var(zeta_finite, ddof=1)) if n_finite > 1 else 0.0
+                z_med = float(np.median(zeta_finite))
+                z_q10 = float(np.quantile(zeta_finite, 0.10))
+                z_q90 = float(np.quantile(zeta_finite, 0.90))
             moment_rows.append({
                 "run_label": run["label"],
                 "epoch": int(epoch),
                 "is_late": int(i >= late_start_idx),
-                "zeta_mean": float(np.mean(zeta)),
-                "zeta_var": float(np.var(zeta, ddof=1)) if n_units > 1 else 0.0,
-                "zeta_median": float(np.median(zeta)),
-                "zeta_q10": float(np.quantile(zeta, 0.10)),
-                "zeta_q90": float(np.quantile(zeta, 0.90)),
+                "zeta_mean": z_mean,
+                "zeta_var": z_var,
+                "zeta_median": z_med,
+                "zeta_q10": z_q10,
+                "zeta_q90": z_q90,
             })
 
         for i in range(late_start_idx, n_checkpoints - 1):
@@ -613,8 +949,23 @@ def main():
         if run_transition_metrics["right_delta"].size > 0:
             all_right_delta.append(run_transition_metrics["right_delta"])
 
-        late_mean = np.mean(zeta_matrix[late_start_idx:], axis=1)
-        late_var = np.var(zeta_matrix[late_start_idx:], axis=1, ddof=1) if n_units > 1 else np.zeros(n_checkpoints - late_start_idx)
+        late_zeta = zeta_matrix[late_start_idx:]
+        late_mean_vals = []
+        late_var_vals = []
+        for zeta in late_zeta:
+            zeta_finite = zeta[np.isfinite(zeta)]
+            if zeta_finite.size == 0:
+                late_mean_vals.append(float("nan"))
+                late_var_vals.append(float("nan"))
+            else:
+                late_mean_vals.append(float(np.mean(zeta_finite)))
+                late_var_vals.append(
+                    float(np.var(zeta_finite, ddof=1))
+                    if zeta_finite.size > 1
+                    else 0.0
+                )
+        late_mean = np.asarray(late_mean_vals, dtype=np.float64)
+        late_var = np.asarray(late_var_vals, dtype=np.float64)
         late_epochs_run = epochs[late_start_idx:].astype(np.float64)
 
         run_summaries.append({
@@ -709,6 +1060,126 @@ def main():
         late_start_epoch=late_start_epoch_plot,
         display_name=display_name,
         outpath=os.path.join(args.outdir, "late_moments.png"),
+    )
+
+    # ------------------------------------------------------------------
+    # Far-left-tail saturation diagnostic (closure F(ζ) = κ + o(1)).
+    # Transition-level blocks: each (current, delta) pair from the main
+    # loop above is one checkpoint-transition "block" (all neurons at once),
+    # which is the natural unit of dependence for a block-bootstrap CI.
+    # ------------------------------------------------------------------
+    transition_blocks = list(zip(all_current, all_delta))
+
+    q_low_sweep = []
+    for tok in str(args.tail_q_low_sweep).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            q_low_sweep.append(float(tok))
+        except ValueError:
+            continue
+    if float(args.tail_q_low_primary) not in q_low_sweep:
+        q_low_sweep.append(float(args.tail_q_low_primary))
+    q_low_sweep = sorted(set(q_low_sweep))
+
+    tail_results = {}
+    for q_low in q_low_sweep:
+        res = compute_tail_saturation_metrics(
+            transition_blocks=transition_blocks,
+            q_low=q_low,
+            trim_fraction=float(args.tail_trim_fraction),
+            bootstrap_B=int(args.tail_bootstrap_B),
+            ci_level=float(args.tail_ci_level),
+            rng_seed=int(args.tail_bootstrap_seed),
+        )
+        tail_results[f"q_low_{q_low:.3f}"] = res
+        if res and not res.get("skipped", False):
+            log(
+                f"  tail saturation q_low={q_low:.3f}: "
+                f"κ̂_tail={res['kappa_tail']:.3e} "
+                f"[{res['kappa_tail_ci_lo']:.3e}, {res['kappa_tail_ci_hi']:.3e}], "
+                f"slope={res['slope_tail']:.3e} "
+                f"[{res['slope_tail_ci_lo']:.3e}, {res['slope_tail_ci_hi']:.3e}], "
+                f"ΔBIC(lin-const)={res['delta_bic_linear_minus_constant']:.2f}, "
+                f"positivity={res['positivity_pass']}, flatness={res['flatness_pass']}, "
+                f"constant_preferred={res['constant_preferred']}"
+            )
+            log(
+                f"    tail cutoff ζ_{{q_low}}={res['tail_zeta_cut']:.3e} "
+                f"(bootstrap CI [{res['tail_zeta_cut_ci_lo']:.3e}, {res['tail_zeta_cut_ci_hi']:.3e}], "
+                f"bs median {res['tail_zeta_cut_bs_median']:.3e}, "
+                f"n_tail pool={res['n_tail_samples']}, bs median n_tail={res['n_tail_samples_bs_median']:.0f})"
+            )
+        else:
+            log(f"  tail saturation q_low={q_low:.3f}: skipped ({res.get('reason', 'n/a')})")
+
+    primary_key = f"q_low_{float(args.tail_q_low_primary):.3f}"
+    tail_primary = tail_results.get(primary_key, {})
+
+    save_json(
+        {
+            "n_runs": int(len(runs)),
+            "low_n_runs_warning": low_n_runs_warning,
+            "q_low_primary": float(args.tail_q_low_primary),
+            "q_low_sweep": q_low_sweep,
+            "tail_trim_fraction": float(args.tail_trim_fraction),
+            "tail_bootstrap_B": int(args.tail_bootstrap_B),
+            "tail_ci_level": float(args.tail_ci_level),
+            "results": tail_results,
+            "primary": tail_primary,
+        },
+        os.path.join(args.outdir, "tail_saturation.json"),
+    )
+
+    # Flat CSV for easy plotting/tabulation
+    tail_csv_rows = []
+    for k in sorted(tail_results.keys()):
+        r = tail_results[k]
+        if not r:
+            continue
+        tail_csv_rows.append([
+            r.get("q_low", float("nan")),
+            r.get("tail_zeta_cut", float("nan")),
+            r.get("tail_zeta_cut_ci_lo", float("nan")),
+            r.get("tail_zeta_cut_ci_hi", float("nan")),
+            r.get("tail_zeta_cut_bs_mean", float("nan")),
+            r.get("tail_zeta_cut_bs_median", float("nan")),
+            int(r.get("n_tail_samples", 0)),
+            r.get("n_tail_samples_bs_median", float("nan")),
+            int(r.get("n_blocks", 0)),
+            r.get("kappa_tail", float("nan")),
+            r.get("kappa_tail_ci_lo", float("nan")),
+            r.get("kappa_tail_ci_hi", float("nan")),
+            r.get("slope_tail", float("nan")),
+            r.get("slope_tail_ci_lo", float("nan")),
+            r.get("slope_tail_ci_hi", float("nan")),
+            r.get("bic_constant", float("nan")),
+            r.get("bic_linear", float("nan")),
+            r.get("delta_bic_linear_minus_constant", float("nan")),
+            int(bool(r.get("positivity_pass", False))),
+            int(bool(r.get("flatness_pass", False))),
+            int(bool(r.get("constant_preferred", False))),
+            int(bool(r.get("skipped", False))),
+        ])
+    save_csv(
+        ["q_low", "tail_zeta_cut", "tail_zeta_cut_ci_lo", "tail_zeta_cut_ci_hi",
+         "tail_zeta_cut_bs_mean", "tail_zeta_cut_bs_median",
+         "n_tail_samples", "n_tail_samples_bs_median", "n_blocks",
+         "kappa_tail", "kappa_tail_ci_lo", "kappa_tail_ci_hi",
+         "slope_tail", "slope_tail_ci_lo", "slope_tail_ci_hi",
+         "bic_constant", "bic_linear", "delta_bic_linear_minus_constant",
+         "positivity_pass", "flatness_pass", "constant_preferred", "skipped"],
+        tail_csv_rows,
+        os.path.join(args.outdir, "tail_saturation.csv"),
+    )
+
+    plot_combined_drift_with_tail(
+        drift_rows,
+        bulk_center=bulk_center,
+        tail_metrics_primary=tail_primary,
+        display_name=display_name,
+        outpath=os.path.join(args.outdir, "conditional_drift_with_tail.png"),
     )
 
     pooled_spearman_rho, pooled_spearman_p = safe_spearmanr(current_all, delta_all)

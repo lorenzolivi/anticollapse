@@ -81,7 +81,12 @@ def estimate_tau_spectrum(
     nb = max(1, math.ceil(Btot / bs))
 
     H = None
-    sum_f = None  # (L, H)
+    # Accumulate E_t[log|μ^(q)_{t,ℓ}|] per neuron per lag, matching the
+    # theoretical definition of μ̄_q (eq. mu_asymptotic_decay_rate).
+    # Previous version accumulated E_t[|μ|] and took log afterward, i.e.
+    # log(E[|μ|]) instead of E[log|μ|]; these differ by Jensen's inequality.
+    sum_log_f = None   # (L, H): sum over sequences of per-neuron log|μ|
+    count_log_f = None  # (L, H): count of finite contributions
     n_seq = 0
 
     for bi in range(nb):
@@ -94,45 +99,56 @@ def estimate_tau_spectrum(
 
             if H is None:
                 H = int(intermediates["leak"].shape[-1])
-                sum_f = np.zeros((fit_lags.size, H), dtype=np.float64)
+                sum_log_f = np.zeros((fit_lags.size, H), dtype=np.float64)
+                count_log_f = np.zeros((fit_lags.size, H), dtype=np.float64)
 
             prefix_cache = {}
             for j, ell in enumerate(fit_lags):
-                mu_tl = compute_mu_tl_for_lag(
+                _mu0, _mu1, mu_tl = compute_mu_tl_for_lag(
                     model_name, intermediates, int(ell),
                     out_dtype=intermediates["leak"].dtype,
                     _prefix_cache=prefix_cache,
                 )
                 if mu_tl.numel() == 0:
                     continue
-                abs_f = torch.abs(mu_tl).double()
-                f_bh = abs_f.mean(dim=1)  # (B, H) mean over start times
-                sum_f[j, :] += f_bh.sum(dim=0).detach().cpu().numpy()
+                # mu_tl: (B, T_valid, H)
+                # Per-neuron E_t[log|μ^(q)_{t,ℓ}|] for each sequence:
+                log_abs = torch.log(torch.abs(mu_tl).clamp(min=1e-30)).double()
+                log_f_bh = log_abs.mean(dim=1)  # (B, H) mean over time steps
+                log_f_np = log_f_bh.detach().cpu().numpy()
+                finite_mask = np.isfinite(log_f_np)
+                log_f_np = np.where(finite_mask, log_f_np, 0.0)
+                sum_log_f[j, :] += log_f_np.sum(axis=0)
+                count_log_f[j, :] += finite_mask.sum(axis=0)
 
         n_seq += int(xb.shape[0])
         del xb, intermediates
 
-    assert sum_f is not None and H is not None
-    f = sum_f / max(1, n_seq)  # (L, H)
-    log_f = np.log(f + 1e-30)
+    assert sum_log_f is not None and H is not None
+    # E_seq[E_t[log|μ^(q)_{t,ℓ}|]] per neuron per lag
+    mean_log_f = np.where(
+        count_log_f > 0,
+        sum_log_f / count_log_f,
+        np.nan,
+    )
 
-    # Linear fit: log f_q(ℓ) = a_q + b_q * ℓ  → τ_q = -1/b_q
+    # Linear fit: E[log|μ^(q)|](ℓ) = a_q + b_q * ℓ  → μ̄_q = -b_q, τ_q = 1/μ̄_q
     ells = fit_lags.astype(np.float64)
     A = np.vstack([np.ones_like(ells), ells]).T  # (L, 2)
 
-    mu_bar = np.zeros(H, dtype=np.float64)
+    mu_bar = np.full(H, np.nan, dtype=np.float64)
+    tau = np.full(H, np.nan, dtype=np.float64)
     r2s = np.full(H, np.nan, dtype=np.float64)
     valid = np.zeros(H, dtype=np.int32)
+    n_rejected = 0  # neurons with non-negative slope (no decay)
 
     for q in range(H):
-        y = log_f[:, q]
+        y = mean_log_f[:, q]
         mask = np.isfinite(y)
         if np.count_nonzero(mask) < 4:
             continue
         coeff, _, _, _ = np.linalg.lstsq(A[mask], y[mask], rcond=None)
         b_q = float(coeff[1])
-        mu_q = max(1e-12, -b_q)  # enforce positive decay rate
-        mu_bar[q] = mu_q
 
         yhat = A[mask] @ coeff
         ss_res = float(np.sum((y[mask] - yhat) ** 2))
@@ -140,20 +156,31 @@ def estimate_tau_spectrum(
         r2s[q] = 1.0 - ss_res / ss_tot
         valid[q] = int(np.count_nonzero(mask))
 
-    tau = 1.0 / np.clip(mu_bar, 1e-12, np.inf)
+        if b_q >= 0:
+            # Non-negative slope: envelope is flat or growing, not decaying.
+            # Mark as invalid rather than manufacturing a spurious giant τ.
+            n_rejected += 1
+            continue
 
+        mu_bar[q] = -b_q
+        tau[q] = 1.0 / (-b_q)
+
+    # Summary statistics over valid (finite, positive) tau values only
+    tau_valid = tau[np.isfinite(tau)]
     info = {
         "fit_lags": fit_lags.tolist(),
         "n_seq": int(n_seq),
-        "tau_mean": float(np.mean(tau)),
-        "tau_q90": float(np.quantile(tau, 0.90)),
-        "tau_q99": float(np.quantile(tau, 0.99)),
-        "mu_bar_mean": float(np.mean(mu_bar)),
+        "tau_mean": float(np.nanmean(tau_valid)) if tau_valid.size > 0 else float("nan"),
+        "tau_q90": float(np.quantile(tau_valid, 0.90)) if tau_valid.size > 0 else float("nan"),
+        "tau_q99": float(np.quantile(tau_valid, 0.99)) if tau_valid.size > 0 else float("nan"),
+        "mu_bar_mean": float(np.nanmean(mu_bar)),
         "r2_mean": float(np.nanmean(r2s)),
         "r2_q10": float(np.nanquantile(r2s, 0.10)),
         "r2_q50": float(np.nanquantile(r2s, 0.50)),
         "r2_q90": float(np.nanquantile(r2s, 0.90)),
-        "n_valid_neurons": int(np.count_nonzero(valid > 0)),
+        "n_valid_neurons": int(tau_valid.size),
+        "n_rejected_nondecaying": int(n_rejected),
+        "n_total_neurons": int(H),
     }
     return tau.astype(np.float64), info
 
@@ -244,6 +271,408 @@ def fit_tau_ccdf_powerlaw(
             "x_lo": x_lo, "x_hi": x_hi, "n_fit": int(xs.size)}
 
 
+def bootstrap_beta_ccdf(
+    tau: np.ndarray,
+    qmin: float,
+    qmax: float,
+    B: int = 2000,
+    ci_level: float = 0.90,
+    seed: int = 42,
+) -> Dict[str, float]:
+    """
+    Bootstrap over the neuron population to quantify within-run
+    uncertainty of the spectral exponent β̂.
+
+    Resamples {τ_q}_{q=1}^{H} with replacement, refits the CCDF
+    tail with the same quantile window, and repeats B times.
+
+    Because neurons sharing the same recurrent dynamics are not
+    truly i.i.d., these intervals should be read as stability
+    diagnostics for the empirical spectrum rather than as rigorous
+    frequentist confidence intervals.
+
+    Returns:
+        dict with:
+            beta_median: median of the bootstrap distribution
+            beta_lo: lower percentile of stability interval
+            beta_hi: upper percentile of stability interval
+            p_beta_lt1: bootstrap probability P(β̂ < 1)
+            beta_std: standard deviation of bootstrap distribution
+            B_effective: number of valid bootstrap replicates
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    tau = tau[np.isfinite(tau) & (tau > 0)]
+    H = tau.size
+    if H < 16:
+        return {
+            "beta_median": float("nan"), "beta_lo": float("nan"),
+            "beta_hi": float("nan"), "p_beta_lt1": float("nan"),
+            "beta_std": float("nan"), "B_effective": 0,
+        }
+
+    alpha_lo = (1.0 - ci_level) / 2.0
+    alpha_hi = 1.0 - alpha_lo
+
+    rng = np.random.RandomState(seed)
+    betas = np.full(B, np.nan, dtype=np.float64)
+    for b in range(B):
+        idx = rng.randint(0, H, size=H)
+        tau_b = tau[idx]
+        res = fit_tau_ccdf_powerlaw(tau_b, qmin=qmin, qmax=qmax)
+        if res["n_fit"] >= 8 and np.isfinite(res["beta_r2"]):
+            betas[b] = res["beta_hat"]
+
+    valid = betas[np.isfinite(betas)]
+    B_eff = valid.size
+    if B_eff < 10:
+        return {
+            "beta_median": float("nan"), "beta_lo": float("nan"),
+            "beta_hi": float("nan"), "p_beta_lt1": float("nan"),
+            "beta_std": float("nan"), "B_effective": int(B_eff),
+        }
+
+    return {
+        "beta_median": float(np.median(valid)),
+        "beta_lo": float(np.percentile(valid, 100.0 * alpha_lo)),
+        "beta_hi": float(np.percentile(valid, 100.0 * alpha_hi)),
+        "p_beta_lt1": float(np.mean(valid < 1.0)),
+        "beta_std": float(np.std(valid)),
+        "B_effective": int(B_eff),
+    }
+
+
+# ============================================================
+# Phase classification
+# ============================================================
+
+def classify_phase(
+    envelope_winner: str,
+    tail_r2: float,
+    beta_lo: float,
+    beta_hi: float,
+    r2_threshold: float = 0.90,
+) -> str:
+    """
+    Operational phase-classification rule (Table 1 in the paper).
+
+    Steps are applied in order; the first matching criterion
+    assigns the phase label.
+
+    Args:
+        envelope_winner: best-fit model by information criterion
+            ('exponential', 'power', or 'tempered')
+        tail_r2: R² of the CCDF power-law tail fit
+        beta_lo: lower bound of bootstrap stability interval
+        beta_hi: upper bound of bootstrap stability interval
+        r2_threshold: goodness-of-fit threshold for CCDF tail
+
+    Returns:
+        phase label string
+    """
+    # Step 1: exponential envelope wins
+    if envelope_winner == "exponential":
+        return "collapsed"
+
+    # Step 2: non-exponential but poor tail fit
+    if (not np.isfinite(tail_r2)) or tail_r2 < r2_threshold:
+        return "anti-collapsed (unresolved beta)"
+
+    # Steps 3-5: tail fit passes — use bootstrap interval
+    if (not np.isfinite(beta_lo)) or (not np.isfinite(beta_hi)):
+        return "anti-collapsed (unresolved beta)"
+
+    if beta_lo > 1.0:
+        return "concentrated anti-collapse"
+    elif beta_hi < 1.0:
+        return "broad anti-collapse"
+    else:
+        return "boundary (soft classification)"
+
+
+# ============================================================
+# Threshold-crossing detection
+# ============================================================
+
+ANTI_COLLAPSED_LABELS = frozenset({
+    "concentrated anti-collapse",
+    "broad anti-collapse",
+    "boundary (soft classification)",
+    "anti-collapsed (unresolved beta)",
+})
+
+
+def _phase_state_from_label(label: str) -> str:
+    """Coarse phase state used by threshold diagnostics."""
+    label = str(label).strip()
+    if label in ANTI_COLLAPSED_LABELS:
+        return "anti_collapsed"
+    if label == "collapsed":
+        return "collapsed"
+    return "unresolved"
+
+
+def _resolve_threshold_phase_label(record: Dict, phase_key: str) -> Tuple[str, bool]:
+    """
+    Resolve a phase label for threshold localization.
+
+    If an aggregated final-phase record is mixed across seeds, use the
+    strict-majority label only when the majority fraction exceeds 0.5.
+    Otherwise leave the condition unresolved.
+    """
+    raw_label = str(record.get(phase_key, "")).strip()
+    if raw_label != "mixed":
+        return raw_label, False
+
+    majority_label = str(record.get("majority_phase_label", "")).strip()
+    majority_fraction = _safe_float(record.get("phase_majority_fraction"))
+    if majority_label and majority_fraction is not None and majority_fraction > 0.5:
+        return majority_label, True
+    return "", False
+
+
+def detect_threshold_crossing(
+    trajectory: List[Dict],
+    persistence: int = 2,
+) -> Dict:
+    """
+    Detect the first stable transition to anti-collapse in a phase
+    trajectory.
+
+    Args:
+        trajectory: list of checkpoint row dicts, ordered by step,
+            each containing at least 'step', 'epoch', 'phase_label',
+            'alpha_hat', and 'beta_env'.
+        persistence: number of consecutive anti-collapsed checkpoints
+            required to confirm the crossing (default 2).
+
+    Returns:
+        dict with keys:
+            crossed: bool — whether a stable crossing was detected
+            t_cross_step: int or None — cumulative optimizer step
+            t_cross_epoch: int or None — epoch at crossing
+            alpha_at_cross: float or None — α̂ at crossing checkpoint
+            beta_env_at_cross: float or None — β_env at crossing
+            phase_at_cross: str or None — phase label at crossing
+            right_censored: bool — True if no observed crossing occurs
+            left_censored: bool — True if the run is already stably
+                anti-collapsed at the first observed checkpoint
+            censoring_kind: str — one of {"observed", "left", "right"}
+            first_observed_step: int or None — first checkpoint step
+            first_observed_epoch: int or None — first checkpoint epoch
+            first_observed_phase: str or None — first checkpoint label
+            horizon_step: int — last observed step (censoring bound)
+    """
+    persistence = max(1, int(persistence))
+    n = len(trajectory)
+    if n == 0:
+        return dict(
+            crossed=False, t_cross_step=None, t_cross_epoch=None,
+            alpha_at_cross=None, beta_env_at_cross=None,
+            phase_at_cross=None,
+            right_censored=True, left_censored=False,
+            censoring_kind="right",
+            first_observed_step=None, first_observed_epoch=None,
+            first_observed_phase=None,
+            horizon_step=0,
+        )
+
+    first_row = trajectory[0]
+    first_observed_step = int(first_row.get("step", 0))
+    first_observed_epoch = int(first_row.get("epoch", 0))
+    first_observed_phase = str(first_row.get("phase_label", ""))
+    horizon_step = int(trajectory[-1].get("step", 0))
+    anti_flags = [
+        _phase_state_from_label(row.get("phase_label", "")) == "anti_collapsed"
+        for row in trajectory
+    ]
+
+    # If the run is already persistently anti-collapsed at the start of
+    # observation, the crossing occurred before the first checkpoint.
+    if n >= persistence and all(anti_flags[:persistence]):
+        return dict(
+            crossed=False, t_cross_step=None, t_cross_epoch=None,
+            alpha_at_cross=None, beta_env_at_cross=None,
+            phase_at_cross=None,
+            right_censored=False, left_censored=True,
+            censoring_kind="left",
+            first_observed_step=first_observed_step,
+            first_observed_epoch=first_observed_epoch,
+            first_observed_phase=first_observed_phase,
+            horizon_step=horizon_step,
+        )
+
+    for i in range(1, n - persistence + 1):
+        # Require an actual switch: checkpoint i-1 is not anti-collapsed,
+        # while i .. i+persistence-1 are all anti-collapsed.
+        if anti_flags[i - 1]:
+            continue
+        if all(anti_flags[i:i + persistence]):
+            row = trajectory[i]
+            return dict(
+                crossed=True,
+                t_cross_step=int(row.get("step", 0)),
+                t_cross_epoch=int(row.get("epoch", 0)),
+                alpha_at_cross=_safe_float(row.get("alpha_hat")),
+                beta_env_at_cross=_safe_float(row.get("beta_env")),
+                phase_at_cross=str(row.get("phase_label", "")),
+                right_censored=False, left_censored=False,
+                censoring_kind="observed",
+                first_observed_step=first_observed_step,
+                first_observed_epoch=first_observed_epoch,
+                first_observed_phase=first_observed_phase,
+                horizon_step=horizon_step,
+            )
+
+    return dict(
+        crossed=False, t_cross_step=None, t_cross_epoch=None,
+        alpha_at_cross=None, beta_env_at_cross=None,
+        phase_at_cross=None,
+        right_censored=True, left_censored=False,
+        censoring_kind="right",
+        first_observed_step=first_observed_step,
+        first_observed_epoch=first_observed_epoch,
+        first_observed_phase=first_observed_phase,
+        horizon_step=horizon_step,
+    )
+
+
+def _safe_float(val):
+    """Convert to float, returning None for missing / non-finite."""
+    if val is None:
+        return None
+    try:
+        v = float(val)
+        return v if np.isfinite(v) else None
+    except (ValueError, TypeError):
+        return None
+
+
+# ============================================================
+# Threshold localization in intervention space (Exp 2)
+# ============================================================
+
+def localize_threshold_bracket(
+    condition_results: List[Dict],
+    intervention_key: str = "condition_value",
+    phase_key: str = "phase_label",
+    higher_means_stronger: bool = True,
+) -> Dict:
+    """
+    Identify the last surviving anti-collapsed condition and the first
+    collapsed condition along an ablation ladder.
+
+    Args:
+        condition_results: list of dicts, one per ablation level,
+            each containing at least `intervention_key` (numeric
+            ablation strength) and `phase_key` (final phase label).
+        intervention_key: key for the numeric ablation value.
+        phase_key: key for the final phase label string.
+        higher_means_stronger: if True, larger values of the
+            intervention key correspond to stronger forcing
+            suppression (e.g., batch size). If False, smaller values
+            are stronger (e.g., clipping norm).
+
+    Returns:
+        dict with keys:
+            bracket_found: bool
+            status: str
+            last_anti_collapsed: float or None (intervention value)
+            last_anti_collapsed_phase: str or None
+            first_collapsed: float or None (intervention value)
+            first_collapsed_phase: str or None
+            bracket_width: float or None
+    """
+    # Sort by intervention strength (weakest → strongest suppression)
+    sorted_results = sorted(
+        condition_results,
+        key=lambda r: float(r[intervention_key]),
+        reverse=not higher_means_stronger,
+    )
+
+    ordered_conditions = []
+    used_majority_vote = False
+    n_mixed_seed_conditions = 0
+
+    for r in sorted_results:
+        val = float(r[intervention_key])
+        raw_label = str(r.get(phase_key, "")).strip()
+        eff_label, used_majority = _resolve_threshold_phase_label(r, phase_key)
+        used_majority_vote = used_majority_vote or used_majority
+        if raw_label == "mixed":
+            n_mixed_seed_conditions += 1
+        ordered_conditions.append({
+            "condition_value": val,
+            "phase_label_raw": raw_label,
+            "phase_label_effective": eff_label,
+            "phase_state": _phase_state_from_label(eff_label),
+            "majority_phase_label": str(r.get("majority_phase_label", "")).strip(),
+            "phase_majority_fraction": _safe_float(r.get("phase_majority_fraction")),
+            "used_majority_vote": used_majority,
+        })
+
+    anti_indices = [
+        i for i, r in enumerate(ordered_conditions)
+        if r["phase_state"] == "anti_collapsed"
+    ]
+    collapsed_indices = [
+        i for i, r in enumerate(ordered_conditions)
+        if r["phase_state"] == "collapsed"
+    ]
+
+    status = "no_resolved_conditions"
+    bracket_found = False
+    last_ac = None
+    last_ac_phase = None
+    first_c = None
+    first_c_phase = None
+    bracket_width = None
+    unresolved_between_boundary = []
+
+    if not ordered_conditions:
+        status = "no_conditions"
+    elif anti_indices and not collapsed_indices:
+        status = "all_anti_collapsed"
+    elif collapsed_indices and not anti_indices:
+        status = "all_collapsed"
+    elif anti_indices and collapsed_indices:
+        first_collapsed_idx = collapsed_indices[0]
+        anti_before = [i for i in anti_indices if i < first_collapsed_idx]
+        anti_after = [i for i in anti_indices if i > first_collapsed_idx]
+
+        if anti_after or not anti_before:
+            status = "non_monotone"
+        else:
+            last_ac_idx = anti_before[-1]
+            last_ac_rec = ordered_conditions[last_ac_idx]
+            first_c_rec = ordered_conditions[first_collapsed_idx]
+            unresolved_between_boundary = [
+                r["condition_value"]
+                for r in ordered_conditions[last_ac_idx + 1:first_collapsed_idx]
+                if r["phase_state"] == "unresolved"
+            ]
+            status = "transition_bracketed"
+            bracket_found = True
+            last_ac = last_ac_rec["condition_value"]
+            last_ac_phase = last_ac_rec["phase_label_effective"]
+            first_c = first_c_rec["condition_value"]
+            first_c_phase = first_c_rec["phase_label_effective"]
+            bracket_width = abs(first_c - last_ac)
+
+    return dict(
+        bracket_found=bracket_found,
+        status=status,
+        last_anti_collapsed=last_ac,
+        last_anti_collapsed_phase=last_ac_phase,
+        first_collapsed=first_c,
+        first_collapsed_phase=first_c_phase,
+        bracket_width=bracket_width,
+        used_majority_vote=used_majority_vote,
+        n_mixed_seed_conditions=n_mixed_seed_conditions,
+        unresolved_between_boundary=unresolved_between_boundary,
+        ordered_conditions=ordered_conditions,
+    )
+
+
 # ============================================================
 # Envelope-β consistency diagnostic (Laplace representation)
 # ============================================================
@@ -332,7 +761,7 @@ def compute_macro_envelope(
 
             prefix_cache = {}
             for j, ell in enumerate(ells):
-                mu_tl = compute_mu_tl_for_lag(
+                _mu0, _mu1, mu_tl = compute_mu_tl_for_lag(
                     model_name, intermediates, int(ell),
                     out_dtype=intermediates["leak"].dtype,
                     _prefix_cache=prefix_cache,
@@ -360,6 +789,16 @@ def extract_adaptive_rate_matrix(
 ) -> Tuple[Optional[torch.Tensor], np.ndarray, Dict[str, object]]:
     """
     Extract the recurrent adaptive-rate matrix λ_{qj} from optimizer state.
+
+    NOTE: This is an approximation to the full Rayleigh projection
+    Λ^(q)_{r,ℓ} defined in the paper.  The theory describes Λ as the
+    projection of the optimizer preconditioner onto the lag-dependent
+    parameter-space direction for neuron q.  Here we extract only the
+    recurrent (H,H) preconditioner blocks, average them equally, and
+    form a row-mean — a reasonable proxy but not the exact object.
+    In particular, input-weight and bias contributions are omitted, and
+    the lag-dependent directional weighting is approximated by the
+    hidden-state-weighted quotient in compute_lag_dependent_rates().
 
     Returns:
         lambda_matrix: (H, H) tensor averaged across recurrent weight matrices,
@@ -541,7 +980,7 @@ def compute_macro_envelope_comparison(
 
             prefix_cache = {}
             for j, ell in enumerate(ells):
-                mu_tl = compute_mu_tl_for_lag(
+                _mu0, _mu1, mu_tl = compute_mu_tl_for_lag(
                     model_name, intermediates, int(ell),
                     out_dtype=intermediates["leak"].dtype,
                     _prefix_cache=prefix_cache,
@@ -617,9 +1056,21 @@ def compute_and_save_final_envelopes(
     device: torch.device,
     ells: np.ndarray,
     diag_batch_size: int,
+    # Optional: pass tau spectrum + fit_lags to compute final phase label.
+    # If tau is None, final phase classification is skipped.
+    tau: Optional[np.ndarray] = None,
+    fit_lags: Optional[np.ndarray] = None,
+    tau_ccdf_qmin: float = 0.75,
+    tau_ccdf_qmax: float = 0.995,
+    beta_bootstrap_B: int = 2000,
+    beta_bootstrap_ci: float = 0.90,
+    phase_r2_threshold: float = 0.90,
 ) -> Dict[str, object]:
     """
-    Save the transport-only envelope bundle plus GELR-weighted comparison files.
+    Save the transport-only envelope bundle plus GELR-weighted comparison
+    files.  If a tau spectrum is provided (or fit_lags are given so one
+    can be extracted), also performs the definitive phase classification
+    using the full AIC-based envelope comparison (Table 1 in the paper).
     """
     env = compute_macro_envelope_comparison(
         model_name=model_name,
@@ -631,13 +1082,22 @@ def compute_and_save_final_envelopes(
         diag_batch_size=diag_batch_size,
     )
 
-    fit_transport = fit_log_envelope_exp_and_power(ells, env["log_f_transport"])
+    # Fit against log(f_transport) = log(E_seq[mass]), NOT against
+    # E_seq[log(mass)].  The paper's envelope is f(ℓ) = H^{-1}||μ||_1,
+    # so the correct log-space observable is log(f), not E[log(·)].
+    log_f_for_fit = np.log(np.maximum(env["f_transport"], 1e-30))
+    fit_transport = fit_log_envelope_exp_and_power(ells, log_f_for_fit)
+
+    # Residual-based crossover diagnostic around ℓ* (Section 7)
+    crossover_diag = crossover_residual_diagnostic(ells, log_f_for_fit, fit_transport)
+    fit_transport["crossover_diagnostic"] = crossover_diag
+
     write_csv(
         os.path.join(mdir, f"{model_name}_envelope.csv"),
         ["ell", "f_mean", "log_f_mean"],
         [
             [int(e), float(fv), float(lv)]
-            for e, fv, lv in zip(ells, env["f_transport"], env["log_f_transport"])
+            for e, fv, lv in zip(ells, env["f_transport"], log_f_for_fit)
         ],
     )
     with open(os.path.join(mdir, f"{model_name}_envelope_fit.json"), "w") as jf:
@@ -652,7 +1112,7 @@ def compute_and_save_final_envelopes(
         [
             [int(e), float(ld), float(le), float(lp), float(lt)]
             for e, ld, le, lp, lt in zip(
-                ells, env["log_f_transport"], log_f_exp, log_f_pow, log_f_temp
+                ells, log_f_for_fit, log_f_exp, log_f_pow, log_f_temp
             )
         ],
     )
@@ -663,7 +1123,9 @@ def compute_and_save_final_envelopes(
         [[int(q), float(v)] for q, v in enumerate(env["lambda_rowmean"])],
     )
 
-    fit_gelr = fit_log_envelope_exp_and_power(ells, env["log_f_gelr"])
+    # Same correction for GELR: fit against log(E[·]) not E[log(·)]
+    log_f_gelr_for_fit = np.log(np.maximum(env["f_gelr"], 1e-30))
+    fit_gelr = fit_log_envelope_exp_and_power(ells, log_f_gelr_for_fit)
     write_csv(
         os.path.join(mdir, f"{model_name}_gelr_envelope_compare.csv"),
         [
@@ -672,17 +1134,22 @@ def compute_and_save_final_envelopes(
             "log_f_transport",
             "f_gelr",
             "log_f_gelr",
+            "geomean_log_transport",
+            "geomean_log_gelr",
             "lambda_mean",
             "lambda_std",
         ],
         [
-            [int(e), float(ft), float(lft), float(fg), float(lfg), float(lm), float(ls)]
-            for e, ft, lft, fg, lfg, lm, ls in zip(
+            [int(e), float(ft), float(lft), float(fg), float(lfg),
+             float(glt), float(glg), float(lm), float(ls)]
+            for e, ft, lft, fg, lfg, glt, glg, lm, ls in zip(
                 ells,
                 env["f_transport"],
-                env["log_f_transport"],
+                log_f_for_fit,       # log(E[·]) — correct observable
                 env["f_gelr"],
-                env["log_f_gelr"],
+                log_f_gelr_for_fit,  # log(E[·]) — correct observable
+                env["log_f_transport"],  # E[log(·)] — geometric mean, diagnostic
+                env["log_f_gelr"],       # E[log(·)] — geometric mean, diagnostic
                 env["lambda_mean"],
                 env["lambda_std"],
             )
@@ -717,7 +1184,7 @@ def compute_and_save_final_envelopes(
             [int(e), float(ld), float(le), float(lp), float(lt)]
             for e, ld, le, lp, lt in zip(
                 ells,
-                env["log_f_gelr"],
+                log_f_gelr_for_fit,  # log(E[·]) — matches what the fit was trained on
                 log_f_gelr_exp,
                 log_f_gelr_pow,
                 log_f_gelr_temp,
@@ -725,11 +1192,89 @@ def compute_and_save_final_envelopes(
         ],
     )
 
+    # --- Final phase classification (Table 1, full rule) ---
+    final_phase = None
+    final_phase_info = {}
+
+    # If tau not provided but fit_lags are available, extract tau now
+    if tau is None and fit_lags is not None:
+        tau, _tau_info = estimate_tau_spectrum(
+            model_name, model, Xdg_cpu,
+            device=device, diag_batch_size=diag_batch_size,
+            fit_lags=fit_lags,
+        )
+
+    if tau is not None:
+        # Step 1: envelope winner from AIC (already computed)
+        _winner = fit_transport.get("envelope_winner", "tempered")
+
+        # Step 2+: CCDF tail fit and bootstrap
+        _tail = fit_tau_ccdf_powerlaw(tau, qmin=tau_ccdf_qmin, qmax=tau_ccdf_qmax)
+        _boot = bootstrap_beta_ccdf(
+            tau, qmin=tau_ccdf_qmin, qmax=tau_ccdf_qmax,
+            B=beta_bootstrap_B, ci_level=beta_bootstrap_ci,
+        )
+
+        final_phase = classify_phase(
+            envelope_winner=_winner,
+            tail_r2=float(_tail["beta_r2"]),
+            beta_lo=float(_boot.get("beta_lo", float("nan"))),
+            beta_hi=float(_boot.get("beta_hi", float("nan"))),
+            r2_threshold=phase_r2_threshold,
+        )
+
+        final_phase_info = {
+            "phase_label": final_phase,
+            "envelope_winner": _winner,
+            "aic": fit_transport.get("aic", {}),
+            "tail_beta_hat": float(_tail["beta_hat"]),
+            "tail_beta_r2": float(_tail["beta_r2"]),
+            "boot_beta_median": float(_boot.get("beta_median", float("nan"))),
+            "boot_beta_lo": float(_boot.get("beta_lo", float("nan"))),
+            "boot_beta_hi": float(_boot.get("beta_hi", float("nan"))),
+            "boot_p_beta_lt1": float(_boot.get("p_beta_lt1", float("nan"))),
+            "boot_B_effective": int(_boot.get("B_effective", 0)),
+            "ell_star": float(fit_transport.get("tempered", {}).get("ell_star", float("nan"))),
+            "phase_r2_threshold": phase_r2_threshold,
+            "crossover_diagnostic": crossover_diag,
+        }
+
+        # Save canonical final phase label
+        with open(os.path.join(mdir, f"{model_name}_final_phase.json"), "w") as jf:
+            def _safe(obj):
+                if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                    return None
+                if isinstance(obj, dict):
+                    return {k: _safe(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_safe(v) for v in obj]
+                if isinstance(obj, np.floating):
+                    v = float(obj)
+                    return None if (math.isnan(v) or math.isinf(v)) else v
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                return obj
+            json.dump(_safe(final_phase_info), jf, indent=2)
+        log(f"[final:{model_name}] phase={final_phase} "
+            f"(winner={_winner}, beta=[{_boot.get('beta_lo', 'nan'):.3f}, "
+            f"{_boot.get('beta_hi', 'nan'):.3f}])")
+        if crossover_diag.get("valid"):
+            _cd_mode = crossover_diag.get("mode", "?")
+            if _cd_mode == "anti_collapsed":
+                log(f"[final:{model_name}] crossover diagnostic: mode={_cd_mode}, "
+                    f"runs_below_pass={crossover_diag.get('runs_below_pass')}, "
+                    f"sign_above_pass={crossover_diag.get('sign_above_pass')}")
+            else:
+                log(f"[final:{model_name}] crossover diagnostic: mode={_cd_mode}, "
+                    f"runs_exp_pass={crossover_diag.get('runs_exp_pass')}")
+
     return {
         "transport_fit": fit_transport,
         "gelr_fit": fit_gelr,
         "gelr_mode": env["gelr_mode"],
         "used_lag_dependent_rates": env["used_lag_dependent_rates"],
+        "final_phase": final_phase,
+        "final_phase_info": final_phase_info,
     }
 
 
@@ -792,6 +1337,25 @@ def fit_log_envelope_exp_and_power(
     beta_temp = float(max(0.0, -d_log))
     tau_max = float(-1.0 / b_ell) if b_ell < 0 else float("inf")
 
+    # AIC for model comparison (Gaussian residual assumption):
+    #   AIC = n log(RSS/n) + 2k, where k = number of parameters
+    n = float(ells.size)
+    aic_exp = n * np.log(ss_res_exp / n + 1e-30) + 2 * 2       # k=2: a, b
+    aic_pow = n * np.log(ss_res_pow / n + 1e-30) + 2 * 2       # k=2: c, d
+    aic_temp = n * np.log(ss_res_temp / n + 1e-30) + 2 * 3     # k=3: a, d_log, b_ell
+
+    aic_dict = {"exponential": float(aic_exp),
+                "power": float(aic_pow),
+                "tempered": float(aic_temp)}
+    envelope_winner = min(aic_dict, key=aic_dict.get)
+
+    # Crossover lag ℓ* = β̂ · τ̂_max (from tempered fit):
+    # the lag where exponential cutoff contribution equals algebraic decay rate
+    if np.isfinite(beta_temp) and np.isfinite(tau_max) and beta_temp > 0 and tau_max > 0:
+        ell_star = beta_temp * tau_max
+    else:
+        ell_star = float("nan")
+
     return {
         "exp": {"a": a, "b": b, "r2": float(r2_exp), "tau_env": tau_env},
         "power": {"c": c, "d": d, "r2": float(r2_pow)},
@@ -802,8 +1366,209 @@ def fit_log_envelope_exp_and_power(
             "beta_env": beta_temp,
             "tau_max": tau_max,
             "r2": float(r2_temp),
+            "ell_star": float(ell_star),
         },
+        "aic": aic_dict,
+        "envelope_winner": envelope_winner,
     }
+
+
+def crossover_residual_diagnostic(
+    ells: np.ndarray,
+    log_mu: np.ndarray,
+    fit: Dict,
+) -> Dict:
+    """Residual-based crossover diagnostic around ℓ* (Section 7).
+
+    For anti-collapsed runs the paper promises:
+      • residuals of the tempered power-law fit are *structureless* below ℓ*
+        (tested via Wald–Wolfowitz runs test on residual signs);
+      • residuals are *exponentially dominated* above ℓ*
+        (tested by checking that residuals w.r.t. pure power-law fit are
+         systematically negative — a one-sided sign test via
+         ``scipy.stats.binomtest``).
+
+    For collapsed / sub-threshold runs (ℓ* undefined or the envelope winner
+    is "exponential"), we instead test whether the exponential envelope
+    holds over a broad lag window by reporting its R² and whether residuals
+    show no trend (runs test on exponential-fit residuals over the full
+    range).
+
+    Returns a dict with test statistics, p-values, and pass/fail flags.
+    All p-values are two-sided for the runs test, one-sided for the sign
+    test.  Pass thresholds: runs-test p > 0.05, sign-test p < 0.05.
+    """
+    from scipy.stats import norm, binomtest
+
+    ells = np.asarray(ells, dtype=float)
+    log_mu = np.asarray(log_mu, dtype=float)
+    mask = np.isfinite(ells) & np.isfinite(log_mu) & (ells > 0)
+    ells = ells[mask]
+    log_mu = log_mu[mask]
+
+    result: Dict = {"valid": False}
+
+    if ells.size < 6 or not fit:
+        return result
+
+    tempered = fit.get("tempered", {})
+    ell_star = tempered.get("ell_star", float("nan"))
+    winner = fit.get("envelope_winner", "tempered")
+
+    # --- Helper: Wald–Wolfowitz runs test (two-sided, normal approx) ---
+    # scipy does not include a one-sample runs test, so we use the
+    # standard normal-approximation formulation with scipy.stats.norm
+    # for the p-value.
+    # Reference: Bradley (1968), "Distribution-Free Statistical Tests",
+    # Ch. 12; also Wald & Wolfowitz (1940), Ann. Math. Statist. 11(2),
+    # pp. 147–162.  Expectation and variance of R under H0:
+    #   E[R] = 1 + 2 n+ n- / n
+    #   Var[R] = 2 n+ n- (2 n+ n- - n) / (n^2 (n-1))
+    def _runs_test(residuals: np.ndarray):
+        """Return (n_runs, z_stat, p_value_two_sided)."""
+        signs = (residuals >= 0).astype(int)
+        n = len(signs)
+        if n < 8:
+            return (float("nan"), float("nan"), float("nan"))
+        n_pos = int(signs.sum())
+        n_neg = n - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return (float("nan"), float("nan"), float("nan"))
+        # Count runs
+        runs = 1 + int(np.sum(signs[1:] != signs[:-1]))
+        # Expected value and variance under H0 (random arrangement)
+        mu_r = 1.0 + 2.0 * n_pos * n_neg / n
+        var_r = (2.0 * n_pos * n_neg * (2.0 * n_pos * n_neg - n)) / (n * n * (n - 1.0))
+        if var_r <= 0:
+            return (float(runs), float("nan"), float("nan"))
+        z = (runs - mu_r) / math.sqrt(var_r)
+        p = float(2.0 * norm.sf(abs(z)))   # two-sided
+        return (float(runs), float(z), float(p))
+
+    # --- Helper: one-sided sign test (H1: median < 0) ---
+    # Uses scipy.stats.binomtest for an exact binomial test.
+    def _sign_test_negative(residuals: np.ndarray):
+        """Test H1: residuals are systematically negative.
+
+        Returns (n_neg, n_total, p_value_one_sided).
+        p is the exact probability under H0 (median = 0) of observing at
+        least as many negatives as we did.
+        """
+        nonzero = residuals[residuals != 0.0]
+        n = len(nonzero)
+        if n < 4:
+            return (float("nan"), float("nan"), float("nan"))
+        n_neg = int(np.sum(nonzero < 0))
+        # Exact one-sided binomial test: H1 is that P(neg) > 0.5
+        p = float(binomtest(n_neg, n, 0.5, alternative="greater").pvalue)
+        return (float(n_neg), float(n), float(p))
+
+    # ------------------------------------------------------------------
+    # Branch 1: anti-collapsed (ℓ* is finite, lies well inside the lag
+    # window, and the envelope winner is not purely exponential).
+    #
+    # We guard against the degenerate case where the tempered fit returns
+    # a mathematically positive but physically meaningless ℓ* (e.g. smaller
+    # than the smallest observed lag, or so large that almost all points
+    # fall on one side).  In those cases neither the below-ℓ* runs test
+    # nor the above-ℓ* sign test has enough data, so we fall through to
+    # the collapsed-mode branch, which applies the broad-window exponential
+    # envelope check instead.
+    min_pts_per_side = 4
+    ell_star_in_range = (
+        np.isfinite(ell_star)
+        and ell_star > 0
+        and ell_star >= float(np.min(ells))
+        and ell_star <= float(np.max(ells))
+    )
+    if ell_star_in_range and winner != "exponential":
+        _n_below = int(np.sum(ells <= ell_star))
+        _n_above = int(np.sum(ells > ell_star))
+        if _n_below < min_pts_per_side or _n_above < min_pts_per_side:
+            ell_star_in_range = False
+
+    if ell_star_in_range and winner != "exponential":
+        # Tempered-fit predicted values
+        log_ell = np.log(ells + 1e-12)
+        a_t = tempered.get("a", 0.0)
+        d_t = tempered.get("d_log", 0.0)
+        b_t = tempered.get("b_ell", 0.0)
+        pred_temp = a_t + d_t * log_ell + b_t * ells
+        resid_temp = log_mu - pred_temp
+
+        # Power-law fit predicted values (for above-ℓ* sign test)
+        pfit = fit.get("power", {})
+        c_p = pfit.get("c", 0.0)
+        d_p = pfit.get("d", 0.0)
+        pred_pow = c_p + d_p * log_ell
+        resid_pow = log_mu - pred_pow
+
+        idx_below = ells <= ell_star
+        idx_above = ells > ell_star
+
+        runs_below = _runs_test(resid_temp[idx_below])
+        sign_above = _sign_test_negative(resid_pow[idx_above])
+
+        result = {
+            "valid": True,
+            "mode": "anti_collapsed",
+            "ell_star": float(ell_star),
+            "n_below": int(idx_below.sum()),
+            "n_above": int(idx_above.sum()),
+            # Below ℓ*: tempered-fit residuals should be structureless
+            "runs_below_n_runs": runs_below[0],
+            "runs_below_z": runs_below[1],
+            "runs_below_p": runs_below[2],
+            "runs_below_pass": bool(
+                np.isfinite(runs_below[2]) and runs_below[2] > 0.05
+            ),
+            # Above ℓ*: power-law residuals should be systematically negative
+            # (exponential cutoff pulls data below pure power-law)
+            "sign_above_n_neg": sign_above[0],
+            "sign_above_n_total": sign_above[1],
+            "sign_above_p": sign_above[2],
+            "sign_above_pass": bool(
+                np.isfinite(sign_above[2]) and sign_above[2] < 0.05
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Branch 2: collapsed / sub-threshold — exponential envelope check.
+    # ------------------------------------------------------------------
+    else:
+        efit = fit.get("exp", {})
+        a_e = efit.get("a", 0.0)
+        b_e = efit.get("b", 0.0)
+        pred_exp = a_e + b_e * ells
+        resid_exp = log_mu - pred_exp
+        r2_exp = efit.get("r2", float("nan"))
+
+        runs_exp = _runs_test(resid_exp)
+
+        # Record why we fell into this branch: either the envelope winner
+        # is genuinely exponential, or ℓ* was out of range / degenerate.
+        if winner == "exponential":
+            fallthrough_reason = "exponential_winner"
+        elif not np.isfinite(ell_star) or ell_star <= 0:
+            fallthrough_reason = "ell_star_undefined"
+        else:
+            fallthrough_reason = "ell_star_out_of_range"
+
+        result = {
+            "valid": True,
+            "mode": "collapsed",
+            "fallthrough_reason": fallthrough_reason,
+            "ell_star": float(ell_star) if np.isfinite(ell_star) else None,
+            "r2_exp": float(r2_exp),
+            "runs_exp_n_runs": runs_exp[0],
+            "runs_exp_z": runs_exp[1],
+            "runs_exp_p": runs_exp[2],
+            "runs_exp_pass": bool(
+                np.isfinite(runs_exp[2]) and runs_exp[2] > 0.05
+            ),
+        }
+
+    return result
 
 
 def eval_envelope_fit_curves(
@@ -1238,8 +2003,53 @@ def run_checkpoint_diagnostics(
     with open(os.path.join(tail_dir, f"{ckpt_tag}_tau_tail_fit.json"), "w") as jf:
         json.dump(tail, jf, indent=2)
 
+    # --- Bootstrap β̂ over neuron population ---
+    boot = bootstrap_beta_ccdf(
+        tau,
+        qmin=float(args.tau_ccdf_qmin),
+        qmax=float(args.tau_ccdf_qmax),
+        B=int(getattr(args, 'beta_bootstrap_B', 2000)),
+        ci_level=float(getattr(args, 'beta_bootstrap_ci', 0.90)),
+    )
+
+    boot_dir = os.path.join(mdir, "checkpoint_beta_bootstrap")
+    os.makedirs(boot_dir, exist_ok=True)
+    with open(os.path.join(boot_dir, f"{ckpt_tag}_beta_bootstrap.json"), "w") as jf:
+        json.dump(_json_safe(boot), jf, indent=2)
+
     # --- Envelope-β consistency ---
     env_info = envelope_beta_from_tau_spectrum(tau)
+
+    # --- Checkpoint-level phase classification ---
+    # At checkpoint time we do NOT have the full three-model AIC
+    # comparison (that runs only at convergence in
+    # compute_and_save_final_envelopes).  We therefore skip
+    # Table 1's step 1 (envelope model comparison) and classify
+    # based on tail-fit quality and bootstrap interval alone.
+    #
+    # If the CCDF tail fit is poor, we cannot distinguish collapsed
+    # from anti-collapsed without the envelope comparison, so the
+    # label is "unresolved (checkpoint)".  If the tail fit is good,
+    # the bootstrap interval assigns concentrated / broad / boundary.
+    # The definitive phase label including the envelope comparison
+    # is emitted only at convergence.
+    _r2_thr = float(getattr(args, 'phase_r2_threshold', 0.90))
+    _tail_ok = (np.isfinite(tail["beta_r2"])
+                and tail["beta_r2"] >= _r2_thr
+                and boot.get("B_effective", 0) >= 10)
+    if not _tail_ok:
+        phase_label = "unresolved (checkpoint)"
+    else:
+        _beta_lo = float(boot.get("beta_lo", float("nan")))
+        _beta_hi = float(boot.get("beta_hi", float("nan")))
+        if not (np.isfinite(_beta_lo) and np.isfinite(_beta_hi)):
+            phase_label = "unresolved (checkpoint)"
+        elif _beta_lo > 1.0:
+            phase_label = "concentrated anti-collapse"
+        elif _beta_hi < 1.0:
+            phase_label = "broad anti-collapse"
+        else:
+            phase_label = "boundary (soft classification)"
 
     # --- Assemble row ---
     row = {
@@ -1254,6 +2064,11 @@ def run_checkpoint_diagnostics(
         "alpha_agreement": float(alpha_info.get("alpha_agreement", float("nan"))),
         "beta_hat": float(tail["beta_hat"]),
         "beta_r2": float(tail["beta_r2"]),
+        "beta_median": float(boot.get("beta_median", float("nan"))),
+        "beta_lo": float(boot.get("beta_lo", float("nan"))),
+        "beta_hi": float(boot.get("beta_hi", float("nan"))),
+        "p_beta_lt1": float(boot.get("p_beta_lt1", float("nan"))),
+        "beta_bootstrap_B_eff": int(boot.get("B_effective", 0)),
         "tau_mean": float(tail["tau_mean"]),
         "tau_q90": float(tail["tau_q90"]),
         "tau_q99": float(tail["tau_q99"]),
@@ -1266,5 +2081,6 @@ def run_checkpoint_diagnostics(
         "n_samples": int(alpha_info.get("n_samples", 0)),
         "beta_env": float(env_info["beta_env"]),
         "beta_env_r2": float(env_info["beta_env_r2"]),
+        "phase_label": str(phase_label),
     }
     return row

@@ -96,7 +96,8 @@ def find_model_dirs(indir: str):
 def load_phase_trajectory(traj_csv: str):
     """
     phase_trajectory.csv columns (new plan):
-      epoch, alpha_hat, sigma_alpha_hat, beta_hat, beta_r2, ...
+      epoch, alpha_hat, sigma_alpha_hat, beta_hat, beta_r2,
+      beta_median, beta_lo, beta_hi, p_beta_lt1, phase_label, ...
     Returns dict with arrays sorted by epoch, or None.
     """
     data = safe_read_csv_named(traj_csv)
@@ -118,13 +119,29 @@ def load_phase_trajectory(traj_csv: str):
     std_a = np.array(rows["alpha_hat_std"], dtype=float) if ("alpha_hat_std" in names) else np.full_like(a, np.nan)
     se_a = np.array(rows["alpha_hat_se"], dtype=float) if ("alpha_hat_se" in names) else np.full_like(a, np.nan)
 
+    # Bootstrap columns (new)
+    beta_median = np.array(rows["beta_median"], dtype=float) if ("beta_median" in names) else np.full_like(b, np.nan)
+    beta_lo = np.array(rows["beta_lo"], dtype=float) if ("beta_lo" in names) else np.full_like(b, np.nan)
+    beta_hi = np.array(rows["beta_hi"], dtype=float) if ("beta_hi" in names) else np.full_like(b, np.nan)
+    p_beta_lt1 = np.array(rows["p_beta_lt1"], dtype=float) if ("p_beta_lt1" in names) else np.full_like(b, np.nan)
+
+    # Phase label (string column)
+    if "phase_label" in names:
+        phase_label = np.array(rows["phase_label"], dtype=str)
+    else:
+        phase_label = np.full(ep.shape, "", dtype=object)
+
     m = np.isfinite(ep) & np.isfinite(a) & np.isfinite(b)
     if not np.any(m):
         return None
     ep, a, b, r2, sig_a, std_a, se_a = ep[m], a[m], b[m], r2[m], sig_a[m], std_a[m], se_a[m]
+    beta_median, beta_lo, beta_hi, p_beta_lt1 = beta_median[m], beta_lo[m], beta_hi[m], p_beta_lt1[m]
+    phase_label = phase_label[m]
 
     order = np.argsort(ep)
     ep, a, b, r2, sig_a, std_a, se_a = ep[order], a[order], b[order], r2[order], sig_a[order], std_a[order], se_a[order]
+    beta_median, beta_lo, beta_hi, p_beta_lt1 = beta_median[order], beta_lo[order], beta_hi[order], p_beta_lt1[order]
+    phase_label = phase_label[order]
 
     return {
         "epoch": ep.astype(int),
@@ -134,6 +151,11 @@ def load_phase_trajectory(traj_csv: str):
         "sigma_alpha_hat": sig_a,
         "alpha_hat_std": std_a,
         "alpha_hat_se": se_a,
+        "beta_median": beta_median,
+        "beta_lo": beta_lo,
+        "beta_hi": beta_hi,
+        "p_beta_lt1": p_beta_lt1,
+        "phase_label": phase_label,
     }
 
 def load_final_from_phase_trajectory(traj_csv: str):
@@ -141,13 +163,66 @@ def load_final_from_phase_trajectory(traj_csv: str):
     if tr is None:
         return None
     i = int(np.argmax(tr["epoch"]))
-    return {
+    result = {
         "epoch": int(tr["epoch"][i]),
         "alpha_hat": float(tr["alpha_hat"][i]),
         "sigma_alpha_hat": float(tr["sigma_alpha_hat"][i]) if np.isfinite(tr["sigma_alpha_hat"][i]) else np.nan,
         "beta_hat": float(tr["beta_hat"][i]),
         "beta_r2": float(tr["beta_r2"][i]) if np.isfinite(tr["beta_r2"][i]) else np.nan,
+        "beta_median": float(tr["beta_median"][i]) if np.isfinite(tr["beta_median"][i]) else np.nan,
+        "beta_lo": float(tr["beta_lo"][i]) if np.isfinite(tr["beta_lo"][i]) else np.nan,
+        "beta_hi": float(tr["beta_hi"][i]) if np.isfinite(tr["beta_hi"][i]) else np.nan,
+        "p_beta_lt1": float(tr["p_beta_lt1"][i]) if np.isfinite(tr["p_beta_lt1"][i]) else np.nan,
+        "phase_label": str(tr["phase_label"][i]) if tr["phase_label"][i] else "",
     }
+    return result
+
+
+def beta_center_array(tr: dict):
+    """Use bootstrap beta median when available, otherwise fall back to beta_hat."""
+    b_med = np.asarray(tr.get("beta_median", np.array([])), dtype=float)
+    b_hat = np.asarray(tr.get("beta_hat", np.array([])), dtype=float)
+    if b_med.shape == b_hat.shape and np.any(np.isfinite(b_med)):
+        return np.where(np.isfinite(b_med), b_med, b_hat)
+    return b_hat
+
+
+def beta_center_scalar(record: dict):
+    b_med = record.get("beta_median", np.nan)
+    if b_med is not None and np.isfinite(b_med):
+        return float(b_med)
+    b_hat = record.get("beta_hat", np.nan)
+    return float(b_hat) if b_hat is not None else np.nan
+
+
+def format_phase_label(phase_data: dict):
+    """Render mixed cross-seed labels without hiding the majority class."""
+    if not isinstance(phase_data, dict):
+        return ""
+    label = str(phase_data.get("phase_label", "")).strip()
+    majority = str(phase_data.get("majority_phase_label", "")).strip()
+    if label == "mixed" and majority:
+        return f"mixed / maj: {majority}"
+    return label
+
+
+def abbreviate_phase_label(label: str):
+    return (
+        str(label)
+        .replace("anti-collapse", "AC")
+        .replace("(soft classification)", "(soft)")
+    )
+
+
+def load_final_phase_json(model_dir: str, model_name: str):
+    for candidate in [
+        os.path.join(model_dir, f"{model_name}_final_phase.json"),
+        os.path.join(model_dir, "final_phase.json"),
+    ]:
+        data = safe_load_json(candidate)
+        if isinstance(data, dict):
+            return data
+    return None
 
 # ------------------------------------------------------------
 # Extract "final phase point" for a model folder (dynamic first)
@@ -179,18 +254,31 @@ def merge_phase_point(model_dir: str, model_name: str):
     # envelope fit (final-only)
     p_env = os.path.join(model_dir, f"{model_name}_envelope_fit.json")
     env = safe_load_json(p_env) or {}
+    final_phase = load_final_phase_json(model_dir, model_name) or {}
 
     # choose alpha/beta
     if dyn is not None:
         alpha_hat = dyn.get("alpha_hat", np.nan)
         beta_hat  = dyn.get("beta_hat", np.nan)
         beta_r2   = dyn.get("beta_r2", np.nan)
+        beta_median = dyn.get("beta_median", np.nan)
+        beta_lo = dyn.get("beta_lo", np.nan)
+        beta_hi = dyn.get("beta_hi", np.nan)
+        p_beta_lt1 = dyn.get("p_beta_lt1", np.nan)
+        phase_label = dyn.get("phase_label", "")
         epoch_fin = dyn.get("epoch", None)
     else:
         alpha_hat = phase.get("alpha_hat", alpha.get("alpha_hat", np.nan))
         beta_hat  = phase.get("beta_hat", tail.get("beta_hat", np.nan))
         beta_r2   = phase.get("beta_r2", tail.get("beta_r2", np.nan))
+        beta_median = np.nan
+        beta_lo = np.nan
+        beta_hi = np.nan
+        p_beta_lt1 = np.nan
+        phase_label = ""
         epoch_fin = phase.get("epoch", None)
+
+    phase_label = format_phase_label(final_phase) or str(phase_label).strip()
 
     # envelope fit R2 (may be absent; keep NaN)
     env_r2_exp = phase.get("env_r2_exp", (env.get("exp", {}) or {}).get("r2", np.nan))
@@ -202,6 +290,11 @@ def merge_phase_point(model_dir: str, model_name: str):
         "alpha_hat": float(alpha_hat) if alpha_hat is not None else np.nan,
         "beta_hat": float(beta_hat) if beta_hat is not None else np.nan,
         "beta_r2": float(beta_r2) if beta_r2 is not None else np.nan,
+        "beta_median": float(beta_median) if beta_median is not None else np.nan,
+        "beta_lo": float(beta_lo) if beta_lo is not None else np.nan,
+        "beta_hi": float(beta_hi) if beta_hi is not None else np.nan,
+        "p_beta_lt1": float(p_beta_lt1) if p_beta_lt1 is not None else np.nan,
+        "phase_label": phase_label,
         "env_r2_exp": float(env_r2_exp) if env_r2_exp is not None else np.nan,
         "env_r2_pow": float(env_r2_pow) if env_r2_pow is not None else np.nan,
         "env_r2_temp": float(env_r2_temp) if env_r2_temp is not None else np.nan,
@@ -231,10 +324,12 @@ def main():
     # ---- collect dynamics (if available) and final summaries
     merged = []
     traj_by_label = {}  # label -> trajectory dict
+    model_dir_by_label = {}
     for e in entries:
         model_dir = e["dir"]
         model_name = e["name"]
         label = e["label"]
+        model_dir_by_label[label] = model_dir
 
         # final point (always try)
         info = merge_phase_point(model_dir, model_name)
@@ -246,6 +341,11 @@ def main():
             "alpha_hat": info["alpha_hat"],
             "beta_hat": info["beta_hat"],
             "beta_r2": info["beta_r2"],
+            "beta_median": info.get("beta_median", np.nan),
+            "beta_lo": info.get("beta_lo", np.nan),
+            "beta_hi": info.get("beta_hi", np.nan),
+            "p_beta_lt1": info.get("p_beta_lt1", np.nan),
+            "phase_label": info.get("phase_label", ""),
             "env_r2_exp": info["env_r2_exp"],
             "env_r2_pow": info["env_r2_pow"],
             "env_r2_temp": info["env_r2_temp"],
@@ -261,8 +361,12 @@ def main():
     # ---- save merged CSV (final checkpoint summary)
     write_csv(
         os.path.join(outdir, "phase_diagram_merged_summary.csv"),
-        ["label", "model", "epoch", "alpha_hat", "beta_hat", "beta_r2", "env_r2_exp", "env_r2_pow", "env_r2_temp"],
-        [[r["label"], r["model"], r["epoch"], r["alpha_hat"], r["beta_hat"], r["beta_r2"], r["env_r2_exp"], r["env_r2_pow"], r["env_r2_temp"]]
+        ["label", "model", "epoch", "alpha_hat", "beta_hat", "beta_r2",
+         "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "phase_label",
+         "env_r2_exp", "env_r2_pow", "env_r2_temp"],
+        [[r["label"], r["model"], r["epoch"], r["alpha_hat"], r["beta_hat"], r["beta_r2"],
+          r["beta_median"], r["beta_lo"], r["beta_hi"], r["p_beta_lt1"], r["phase_label"],
+          r["env_r2_exp"], r["env_r2_pow"], r["env_r2_temp"]]
          for r in merged]
     )
 
@@ -290,12 +394,12 @@ def main():
         plt.savefig(os.path.join(outdir, "phase_dynamics_alpha_vs_epoch.png"), dpi=args.dpi, bbox_inches="tight")
         plt.close()
 
-        # 2) beta(t) vs epoch overlay
+        # 2) beta(t) vs epoch overlay — with bootstrap stability interval
         plt.figure(figsize=(7.6, 4.8))
         any_beta = False
         for label in sorted(traj_by_label.keys()):
             tr = traj_by_label[label]
-            b = tr["beta_hat"]
+            b = beta_center_array(tr)
             ep = tr["epoch"]
 
             if np.isfinite(args.min_r2):
@@ -306,25 +410,42 @@ def main():
 
             if np.any(mask):
                 any_beta = True
-                plt.plot(ep[mask], b[mask], linewidth=2.0, label=label)
+                line, = plt.plot(ep[mask], b[mask], linewidth=2.0, label=label)
+                # Bootstrap 90% stability interval (beta_lo, beta_hi)
+                blo = tr["beta_lo"]
+                bhi = tr["beta_hi"]
+                boot_mask = mask & np.isfinite(blo) & np.isfinite(bhi)
+                if np.any(boot_mask):
+                    plt.fill_between(ep[boot_mask], blo[boot_mask], bhi[boot_mask],
+                                     alpha=0.15, color=line.get_color())
 
         if any_beta:
+            plt.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.5, label=r"$\beta=1$")
             plt.xlabel("epoch")
-            plt.ylabel(r"$\hat{\beta}(t)$")
-            plt.title(r"Phase dynamics: time-scale tail exponent")
+            plt.ylabel(r"$\hat{\beta}_{\mathrm{med}}(t)$")
+            plt.title(r"Phase dynamics: bootstrap spectral exponent (90% stability band)")
             plt.grid(True, alpha=0.25)
             plt.legend(fontsize=8)
             plt.tight_layout()
             plt.savefig(os.path.join(outdir, "phase_dynamics_beta_vs_epoch.png"), dpi=args.dpi, bbox_inches="tight")
         plt.close()
 
-        # 3) phase trajectory in (alpha, beta)
+        # 3) phase trajectory in (alpha, beta) — annotate with final phase label
         plt.figure(figsize=(6.8, 5.2))
         any_traj = False
+
+        # Phase label -> marker style mapping
+        _phase_markers = {
+            "collapsed": "X",
+            "concentrated anti-collapse": "^",
+            "broad anti-collapse": "v",
+            "boundary (soft classification)": "D",
+        }
+
         for label in sorted(traj_by_label.keys()):
             tr = traj_by_label[label]
             a = tr["alpha_hat"]
-            b = tr["beta_hat"]
+            b = beta_center_array(tr)
             ep = tr["epoch"]
 
             if np.isfinite(args.min_r2):
@@ -340,10 +461,30 @@ def main():
             # line + markers to show time direction (epoch increasing)
             plt.plot(a[mask], b[mask], marker="o", markersize=3.0, linewidth=1.6, label=label)
 
-            # annotate final point only (clean)
+            # annotate final point with phase label (from trajectory or final_phase.json)
             a_last = a[mask][-1]
             b_last = b[mask][-1]
-            plt.text(a_last, b_last, f" {label}", fontsize=8, va="center")
+
+            # Try to load final phase from JSON (definitive classification)
+            final_phase_label = ""
+            fp_data = load_final_phase_json(model_dir_by_label.get(label, os.path.join(indir, label)), label)
+            if fp_data:
+                final_phase_label = format_phase_label(fp_data)
+
+            # Fall back to last checkpoint phase_label from trajectory
+            if not final_phase_label:
+                pl = tr["phase_label"]
+                if pl is not None and len(pl) > 0:
+                    last_pl = str(pl[-1]).strip()
+                    if last_pl:
+                        final_phase_label = last_pl
+
+            # Annotate final point
+            ann_text = f" {label}"
+            if final_phase_label:
+                short_label = abbreviate_phase_label(final_phase_label)
+                ann_text += f"\n [{short_label}]"
+            plt.text(a_last, b_last, ann_text, fontsize=7, va="center")
 
             # R5: direction arrows at ~1/3 and ~2/3 of trajectory
             a_m, b_m = a[mask], b[mask]
@@ -358,9 +499,11 @@ def main():
                                                  lw=1.5))
 
         if any_traj:
+            plt.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.4, label=r"$\beta=1$")
+            plt.axvline(x=2.0, color="gray", linestyle=":", linewidth=1, alpha=0.4, label=r"$\alpha=2$")
             plt.xlabel(r"gradient tail index $\hat{\alpha}(t)$")
-            plt.ylabel(r"time-scale tail exponent $\hat{\beta}(t)$")
-            ttl = r"Dynamical phase trajectories in $(\hat{\alpha}, \hat{\beta})$"
+            plt.ylabel(r"bootstrap spectral exponent $\hat{\beta}_{\mathrm{med}}(t)$")
+            ttl = r"Dynamical phase trajectories in $(\hat{\alpha}, \hat{\beta}_{\mathrm{med}})$"
             if np.isfinite(args.min_r2) and args.min_r2 > -np.inf:
                 ttl += rf" (filtered: $R^2\geq {args.min_r2:g}$)"
             plt.title(ttl)
@@ -380,10 +523,16 @@ def main():
                     float(tr["alpha_hat"][i]),
                     float(tr["beta_hat"][i]),
                     float(tr["beta_r2"][i]) if np.isfinite(tr["beta_r2"][i]) else np.nan,
+                    float(tr["beta_median"][i]) if np.isfinite(tr["beta_median"][i]) else np.nan,
+                    float(tr["beta_lo"][i]) if np.isfinite(tr["beta_lo"][i]) else np.nan,
+                    float(tr["beta_hi"][i]) if np.isfinite(tr["beta_hi"][i]) else np.nan,
+                    float(tr["p_beta_lt1"][i]) if np.isfinite(tr["p_beta_lt1"][i]) else np.nan,
+                    str(tr["phase_label"][i]) if tr["phase_label"][i] else "",
                 ])
         write_csv(
             os.path.join(outdir, "phase_trajectories_long.csv"),
-            ["label", "epoch", "alpha_hat", "beta_hat", "beta_r2"],
+            ["label", "epoch", "alpha_hat", "beta_hat", "beta_r2",
+             "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "phase_label"],
             rows
         )
 
@@ -395,12 +544,12 @@ def main():
     plt.figure(figsize=(6.8, 4.8))
     for r in merged:
         a = r["alpha_hat"]
-        b = r["beta_hat"]
+        b = beta_center_scalar(r)
         if np.isfinite(a) and np.isfinite(b):
             plt.scatter([a], [b])
             plt.text(a, b, f" {r['label']}", va="center", fontsize=8)
     plt.xlabel(r"gradient tail index $\hat{\alpha}$")
-    plt.ylabel(r"time-scale tail exponent $\hat{\beta}$")
+    plt.ylabel(r"bootstrap spectral exponent $\hat{\beta}_{\mathrm{med}}$")
     plt.title(r"Empirical phase summary (final checkpoint)")
     plt.grid(True, alpha=0.25)
     plt.tight_layout()

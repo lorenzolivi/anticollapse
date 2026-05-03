@@ -18,6 +18,74 @@ import numpy as np
 import torch
 
 
+def sample_heavy_tailed_lags(
+    K: int,
+    lag_min: int,
+    lag_max: int,
+    alpha_task: float,
+    rng: Optional[np.random.Generator] = None,
+) -> List[int]:
+    """
+    Draw K target lags from a truncated Pareto distribution on [lag_min, lag_max]
+    with tail index alpha_task > 0. Smaller alpha_task => heavier tail (more mass
+    near lag_max). Returns a sorted list of unique integer lags.
+
+    Sampling uses inverse-CDF of the truncated Pareto density
+        p(l) ∝ l^{-(alpha_task + 1)}, l ∈ [lag_min, lag_max].
+
+    If unique sampling cannot fill K slots (e.g. K close to lag_max-lag_min),
+    the remaining slots are filled by a monotone integer grid on [lag_min, lag_max].
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    assert lag_min >= 1 and lag_max > lag_min and K >= 1
+    assert alpha_task > 0.0
+
+    a = float(lag_min)
+    b = float(lag_max)
+    alpha = float(alpha_task)
+
+    # Inverse CDF of truncated Pareto with density ∝ l^{-(alpha+1)} on [a, b]:
+    # F(l) = (a^{-alpha} - l^{-alpha}) / (a^{-alpha} - b^{-alpha})
+    # => l = (a^{-alpha} - U * (a^{-alpha} - b^{-alpha}))^{-1/alpha}
+    lags_set = set()
+    max_tries = 50 * K
+    tries = 0
+    while len(lags_set) < K and tries < max_tries:
+        U = rng.uniform(size=max(1, K - len(lags_set)))
+        inv = a ** (-alpha) - U * (a ** (-alpha) - b ** (-alpha))
+        samples = inv ** (-1.0 / alpha)
+        for s in samples:
+            l = int(round(float(s)))
+            l = max(lag_min, min(lag_max, l))
+            lags_set.add(l)
+            if len(lags_set) >= K:
+                break
+        tries += 1
+
+    if len(lags_set) < K:
+        fill = np.linspace(lag_min, lag_max, K, dtype=int).tolist()
+        for l in fill:
+            lags_set.add(int(l))
+            if len(lags_set) >= K:
+                break
+
+    return sorted(lags_set)[:K]
+
+
+def build_task_coeffs(
+    K: int,
+    coeff_base: float = 0.6,
+    coeff_decay: float = 0.85,
+) -> List[float]:
+    """
+    Geometrically decaying coefficient schedule c_k = coeff_base * coeff_decay^{k}
+    for k=0,...,K-1. This matches the spirit of the fixed-lag default
+    {0.6, 0.5, 0.4, 0.32, 0.26} (ratios ~0.83).
+    """
+    return [float(coeff_base * (coeff_decay ** k)) for k in range(K)]
+
+
 def make_dataset_cpu(
     Nseq: int,
     T: int,

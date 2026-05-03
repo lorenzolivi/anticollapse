@@ -109,6 +109,8 @@ def load_aggregated_trajectory(model_dir: str):
     METRICS = [
         "alpha_hat", "sigma_alpha_hat", "alpha_hat_std", "alpha_hat_se",
         "beta_hat", "beta_r2",
+        "beta_median", "beta_lo", "beta_hi", "p_beta_lt1",
+        "beta_bootstrap_B_eff",
         "tau_mean", "tau_q90", "tau_q99",
         "tau_fit_r2_mean", "tau_fit_n_valid",
     ]
@@ -242,6 +244,63 @@ def plot_dynamics_with_se(entries, outdir, dpi):
         plt.savefig(os.path.join(outdir, "ms_beta_hat_vs_epoch.png"), dpi=dpi, bbox_inches="tight")
     plt.close()
 
+    # ---- beta_median(t) with bootstrap 90% stability interval ----
+    plt.figure(figsize=(7.6, 4.8))
+    any_data = False
+    for label in labels:
+        tr = traj_by_label[label]
+        ep = tr["epoch"]
+        y = tr["beta_median_mean"]
+        blo = tr.get("beta_lo_mean", np.full_like(ep, np.nan, dtype=float))
+        bhi = tr.get("beta_hi_mean", np.full_like(ep, np.nan, dtype=float))
+        m = np.isfinite(ep) & np.isfinite(y)
+        if np.any(m):
+            any_data = True
+            line, = plt.plot(ep[m], y[m], linewidth=2.0, label=label)
+            # Bootstrap stability interval (not cross-seed SE — within-run uncertainty)
+            boot_m = m & np.isfinite(blo) & np.isfinite(bhi)
+            if np.any(boot_m):
+                plt.fill_between(ep[boot_m], blo[boot_m], bhi[boot_m],
+                                 alpha=0.15, color=line.get_color())
+    if any_data:
+        plt.axhline(y=1.0, color="gray", linestyle="--", linewidth=1, alpha=0.5, label=r"$\beta=1$")
+        plt.xlabel("epoch")
+        plt.ylabel(r"$\hat{\beta}_{\mathrm{median}}(t)$")
+        plt.title(r"Bootstrap $\hat{\beta}$ dynamics (median $\pm$ 90% stability interval)")
+        plt.grid(True, alpha=0.25)
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "ms_beta_median_bootstrap_vs_epoch.png"), dpi=dpi, bbox_inches="tight")
+    plt.close()
+
+    # ---- P(beta < 1) dynamics ----
+    plt.figure(figsize=(7.6, 4.8))
+    any_data = False
+    for label in labels:
+        tr = traj_by_label[label]
+        ep = tr["epoch"]
+        y = tr.get("p_beta_lt1_mean", np.full_like(ep, np.nan, dtype=float))
+        se = tr.get("p_beta_lt1_se", np.full_like(ep, np.nan, dtype=float))
+        m = np.isfinite(ep) & np.isfinite(y)
+        if np.any(m):
+            any_data = True
+            line, = plt.plot(ep[m], y[m], linewidth=2.0, label=label)
+            if np.any(np.isfinite(se[m]) & (se[m] > 0)):
+                plt.fill_between(ep[m], np.maximum(y[m] - se[m], 0),
+                                 np.minimum(y[m] + se[m], 1),
+                                 alpha=0.18, color=line.get_color())
+    if any_data:
+        plt.axhline(y=0.5, color="gray", linestyle="--", linewidth=1, alpha=0.5)
+        plt.xlabel("epoch")
+        plt.ylabel(r"$P(\hat{\beta}<1)$")
+        plt.ylim(-0.05, 1.05)
+        plt.title(r"Bootstrap probability $P(\hat{\beta}<1)$ over training")
+        plt.grid(True, alpha=0.25)
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(os.path.join(outdir, "ms_p_beta_lt1_vs_epoch.png"), dpi=dpi, bbox_inches="tight")
+    plt.close()
+
     # ---- tau_mean(t) (LOG SCALE) ----
     plt.figure(figsize=(7.6, 4.8))
     any_data = False
@@ -355,7 +414,9 @@ def plot_dynamics_with_se(entries, outdir, dpi):
         tr = traj_by_label[label]
         ep = tr["epoch"]
         a = tr["alpha_hat_mean"]
-        b = tr["beta_hat_mean"]
+        b_med = tr.get("beta_median_mean", np.full_like(a, np.nan, dtype=float))
+        b_hat = tr["beta_hat_mean"]
+        b = np.where(np.isfinite(b_med), b_med, b_hat)
         m = np.isfinite(a) & np.isfinite(b)
         if not np.any(m):
             continue
@@ -376,8 +437,8 @@ def plot_dynamics_with_se(entries, outdir, dpi):
                                              lw=1.5))
     if any_traj:
         plt.xlabel(r"$\hat{\alpha}(t)$")
-        plt.ylabel(r"$\hat{\beta}(t)$")
-        plt.title(r"Phase trajectory $(\hat{\alpha}, \hat{\beta})$ — multi-seed mean")
+        plt.ylabel(r"$\hat{\beta}_{\mathrm{med}}(t)$")
+        plt.title(r"Phase trajectory $(\hat{\alpha}, \hat{\beta}_{\mathrm{med}})$ — multi-seed mean")
         plt.grid(True, alpha=0.25)
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "ms_phase_trajectory_alpha_beta.png"), dpi=dpi, bbox_inches="tight")

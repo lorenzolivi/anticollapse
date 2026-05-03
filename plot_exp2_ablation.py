@@ -27,6 +27,8 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import to_rgba
 import warnings
 
+from seed_utils import safe_read_csv_named, safe_load_json
+
 warnings.filterwarnings('ignore', category=UserWarning)
 
 # Set matplotlib style for publication-quality figures
@@ -93,6 +95,33 @@ class Experiment2Plotter:
                 return 'step', step
         return 'epoch', np.asarray(data['epoch'], dtype=float)
 
+    @staticmethod
+    def _beta_center(data: Dict[str, np.ndarray]) -> np.ndarray:
+        """Use bootstrap beta median when available, otherwise fall back to beta_hat."""
+        b_med = np.asarray(data.get('beta_median', np.array([])), dtype=float)
+        b_hat = np.asarray(data.get('beta_hat', np.array([])), dtype=float)
+        if b_med.shape == b_hat.shape and np.any(np.isfinite(b_med)):
+            return np.where(np.isfinite(b_med), b_med, b_hat)
+        return b_hat
+
+    @staticmethod
+    def _format_phase_label(phase_data: Dict) -> str:
+        if not isinstance(phase_data, dict):
+            return ""
+        label = str(phase_data.get("phase_label", "")).strip()
+        majority = str(phase_data.get("majority_phase_label", "")).strip()
+        if label == "mixed" and majority:
+            return f"mixed / maj: {majority}"
+        return label
+
+    @staticmethod
+    def _short_phase_label(label: str) -> str:
+        return (
+            str(label)
+            .replace("anti-collapse", "AC")
+            .replace("(soft classification)", "(soft)")
+        )
+
     def load_phase_trajectory(self, model: str, condition: str, value: str = None
                              ) -> Optional[Dict[str, np.ndarray]]:
         """
@@ -116,9 +145,11 @@ class Experiment2Plotter:
             fpath = cond_dir / fname
             if fpath.exists():
                 try:
-                    data = np.genfromtxt(fpath, delimiter=',', dtype=float,
-                                        names=True, filling_values=np.nan)
-                    loaded = {name: data[name] for name in data.dtype.names}
+                    data = safe_read_csv_named(str(fpath))
+                    if data is None:
+                        continue
+                    rows = np.array([data]) if getattr(data, "shape", ()) == () else data
+                    loaded = {name: np.array(rows[name]) for name in rows.dtype.names}
                     if fname == 'phase_trajectory_aggregated.csv':
                         normalized = {}
                         for name, values in loaded.items():
@@ -180,11 +211,24 @@ class Experiment2Plotter:
                     self.data[model][cond_name] = data
                     print(f"Loaded {model}/{cond_name}")
 
+    def _get_phase_label(self, model: str, condition: str) -> str:
+        """Try to read final phase label from final_phase.json."""
+        cond_dir = self.agg_dir / model / f"condition_{condition}"
+        for fname in [f"{model}_final_phase.json", "final_phase.json"]:
+            fpath = cond_dir / fname
+            d = safe_load_json(str(fpath))
+            if isinstance(d, dict):
+                label = self._format_phase_label(d)
+                if label:
+                    return label
+        return ""
+
     def plot_phase_trajectories_3panel(self) -> None:
         """
-        Figure 1: Phase trajectories in (α̂, β̂) plane — one panel per model.
+        Figure 1: Phase trajectories in (α̂, β̂_med) plane — one panel per model.
 
-        Shows baseline and all ablations on separate subplots.
+        Shows baseline and all ablations on separate subplots, with phase labels
+        annotated at the final point.
         """
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         fig.suptitle('Phase Trajectories: Ablation Study', fontsize=14, fontweight='bold')
@@ -197,53 +241,86 @@ class Experiment2Plotter:
                        transform=ax.transAxes)
                 continue
 
+            # Collect final-point annotations for phase labels
+            _final_annotations = []  # list of (alpha, beta, short_label, color)
+
+            def _annotate_final(data, cond_key, color):
+                """Record final-point annotation if phase label available."""
+                a_arr = np.asarray(data['alpha_hat'], dtype=float)
+                b_arr = self._beta_center(data)
+                valid = np.isfinite(a_arr) & np.isfinite(b_arr)
+                if not np.any(valid):
+                    return
+                a_last, b_last = a_arr[valid][-1], b_arr[valid][-1]
+                pl = self._get_phase_label(model, cond_key)
+                if not pl:
+                    # Fall back to phase_label column in data
+                    if 'phase_label' in data:
+                        pl_arr = np.asarray(data['phase_label'], dtype=str)
+                        pl_valid = pl_arr[valid]
+                        if len(pl_valid) > 0:
+                            pl = str(pl_valid[-1]).strip()
+                if pl:
+                    short = self._short_phase_label(pl)
+                    _final_annotations.append((a_last, b_last, short, color))
+
             # Plot baseline
             if 'baseline' in self.data[model]:
                 data = self.data[model]['baseline']
-                ax.plot(data['alpha_hat'], data['beta_hat'],
+                ax.plot(data['alpha_hat'], self._beta_center(data),
                        color=self.baseline_color, linestyle=self.baseline_style,
                        linewidth=2, label='Baseline', marker='o', markersize=4,
                        markevery=max(1, len(data['alpha_hat'])//10))
+                _annotate_final(data, 'baseline', self.baseline_color)
 
             # Plot batch ablations
             for i, batch_val in enumerate(['2048', '4096', '8192']):
                 cond_name = f'batch_ablation_{batch_val}'
                 if cond_name in self.data[model]:
                     data = self.data[model][cond_name]
-                    ax.plot(data['alpha_hat'], data['beta_hat'],
+                    ax.plot(data['alpha_hat'], self._beta_center(data),
                            color=self.batch_colors[i], linestyle=self.batch_style,
                            linewidth=1.5, alpha=0.7,
                            label=f'Batch {batch_val}', marker='s', markersize=3,
                            markevery=max(1, len(data['alpha_hat'])//10))
+                    _annotate_final(data, f'batch_ablation_{batch_val}', self.batch_colors[i])
 
             # Plot clip ablations
             for i, clip_val in enumerate(['0.1', '0.01', '0.001']):
                 cond_name = f'clip_ablation_{clip_val}'
                 if cond_name in self.data[model]:
                     data = self.data[model][cond_name]
-                    ax.plot(data['alpha_hat'], data['beta_hat'],
+                    ax.plot(data['alpha_hat'], self._beta_center(data),
                            color=self.clip_colors[i], linestyle=self.clip_style,
                            linewidth=1.5, alpha=0.7,
                            label=f'Clip {clip_val}', marker='^', markersize=3,
                            markevery=max(1, len(data['alpha_hat'])//10))
+                    _annotate_final(data, f'clip_ablation_{clip_val}', self.clip_colors[i])
 
             # Plot winsorize ablations
             for i, wins_val in enumerate(['95', '90', '80']):
                 cond_name = f'winsorize_ablation_{wins_val}'
                 if cond_name in self.data[model]:
                     data = self.data[model][cond_name]
-                    ax.plot(data['alpha_hat'], data['beta_hat'],
+                    ax.plot(data['alpha_hat'], self._beta_center(data),
                            color=self.winsorize_colors[i], linestyle=self.winsorize_style,
                            linewidth=1.5, alpha=0.7,
                            label=f'Wins {wins_val}', marker='D', markersize=3,
                            markevery=max(1, len(data['alpha_hat'])//10))
+                    _annotate_final(data, f'winsorize_ablation_{wins_val}', self.winsorize_colors[i])
+
+            # Annotate final points with phase labels
+            for a_f, b_f, short, col in _final_annotations:
+                ax.annotate(short, xy=(a_f, b_f), fontsize=6, color=col,
+                           xytext=(4, 4), textcoords="offset points",
+                           bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=col, alpha=0.7))
 
             # Add critical lines
             ax.axhline(y=1, color='gray', linestyle='--', linewidth=1, alpha=0.5, label='β=1 (critical)')
             ax.axvline(x=2, color='gray', linestyle=':', linewidth=1, alpha=0.5, label='α=2 (Gaussian)')
 
             ax.set_xlabel('α̂ (gradient tail index)', fontsize=12)
-            ax.set_ylabel('β̂ (spectral exponent)', fontsize=12)
+            ax.set_ylabel('β̂_med (spectral exponent)', fontsize=12)
             ax.set_title(model.upper(), fontsize=13, fontweight='bold')
             ax.legend(loc='best', fontsize=9, framealpha=0.9)
             ax.grid(True, alpha=0.3)
@@ -253,7 +330,7 @@ class Experiment2Plotter:
 
     def plot_beta_timeseries_by_ablation(self) -> None:
         """
-        Figure 2: β̂ time series — one panel per ablation type.
+        Figure 2: bootstrap β̂_median time series — one panel per ablation type.
 
         All models on the same panel, organized by ablation type.
         """
@@ -273,14 +350,23 @@ class Experiment2Plotter:
                 if model not in self.data:
                     continue
 
-                # Plot baseline for this model
+                # Plot baseline for this model (with bootstrap band if available)
                 if 'baseline' in self.data[model]:
                     data = self.data[model]['baseline']
                     _, time_axis = self._time_axis(data)
-                    ax.plot(time_axis, data['beta_hat'],
+                    beta_center = self._beta_center(data)
+                    line, = ax.plot(time_axis, beta_center,
                            color=f'C{model_idx}', linestyle=self.baseline_style,
                            linewidth=2, alpha=0.8, label=f'{model.upper()} (baseline)',
                            marker='o', markersize=3, markevery=max(1, len(time_axis)//8))
+                    # Bootstrap stability interval
+                    if 'beta_lo' in data and 'beta_hi' in data:
+                        blo = np.asarray(data['beta_lo'], dtype=float)
+                        bhi = np.asarray(data['beta_hi'], dtype=float)
+                        boot_m = np.isfinite(blo) & np.isfinite(bhi)
+                        if np.any(boot_m):
+                            ax.fill_between(time_axis[boot_m], blo[boot_m], bhi[boot_m],
+                                           alpha=0.1, color=line.get_color())
 
                 # Plot ablation conditions
                 for val_idx, val in enumerate(values):
@@ -288,6 +374,7 @@ class Experiment2Plotter:
                     if cond_name in self.data[model]:
                         data = self.data[model][cond_name]
                         _, time_axis = self._time_axis(data)
+                        beta_center = self._beta_center(data)
                         # Opacity proportional to ablation strength (inverse of value)
                         if ablation_type == 'batch_ablation':
                             alpha = 0.4 + 0.3 * (val_idx / len(values))
@@ -296,17 +383,25 @@ class Experiment2Plotter:
                         else:  # winsorize
                             alpha = 0.4 + 0.3 * ((len(values) - val_idx) / len(values))
 
-                        ax.plot(time_axis, data['beta_hat'],
+                        line, = ax.plot(time_axis, beta_center,
                                color=colors[val_idx], linestyle=line_style,
                                linewidth=1.5, alpha=alpha,
                                label=f'{model.upper()} {ablation_type.split("_")[0]} {val}',
                                marker='s', markersize=2, markevery=max(1, len(time_axis)//8))
+                        # Bootstrap stability interval for ablation
+                        if 'beta_lo' in data and 'beta_hi' in data:
+                            blo = np.asarray(data['beta_lo'], dtype=float)
+                            bhi = np.asarray(data['beta_hi'], dtype=float)
+                            boot_m = np.isfinite(blo) & np.isfinite(bhi)
+                            if np.any(boot_m):
+                                ax.fill_between(time_axis[boot_m], blo[boot_m], bhi[boot_m],
+                                               alpha=0.08, color=line.get_color())
 
             # Add critical line
             ax.axhline(y=1, color='gray', linestyle='--', linewidth=1.5, alpha=0.5, label='β=1')
 
             ax.set_xlabel('Optimizer Step', fontsize=12)
-            ax.set_ylabel('β̂ (spectral exponent)', fontsize=12)
+            ax.set_ylabel('β̂_med (spectral exponent)', fontsize=12)
             ablation_title = ablation_type.replace('_', ' ').title()
             ax.set_title(f'{ablation_title}', fontsize=13, fontweight='bold')
             ax.legend(loc='best', fontsize=8, framealpha=0.9)
@@ -381,7 +476,7 @@ class Experiment2Plotter:
 
     def plot_final_beta_summary(self) -> None:
         """
-        Figure 4: Summary bar chart of final-epoch β̂ for each (model, condition).
+        Figure 4: Summary bar chart of final-epoch β̂_median for each (model, condition).
 
         Grouped by model, bars colored by condition.
         """
@@ -394,17 +489,19 @@ class Experiment2Plotter:
                 continue
 
             for cond_name, data in self.data[model].items():
-                if 'beta_hat' in data and len(data['beta_hat']) > 0:
+                beta_center = self._beta_center(data)
+                if len(beta_center) > 0:
                     # Use last non-NaN value
-                    valid_idx = ~np.isnan(data['beta_hat'])
+                    valid_idx = ~np.isnan(beta_center)
                     if np.any(valid_idx):
-                        final_betas[model][cond_name] = data['beta_hat'][valid_idx][-1]
+                        final_betas[model][cond_name] = beta_center[valid_idx][-1]
 
                         # Try to get SE if available
-                        if 'beta_hat_se' in data:
-                            se_valid_idx = ~np.isnan(data['beta_hat_se'])
+                        se_key = 'beta_median_se' if 'beta_median_se' in data else 'beta_hat_se'
+                        if se_key in data:
+                            se_valid_idx = ~np.isnan(data[se_key])
                             if np.any(se_valid_idx):
-                                final_betas_se[model][cond_name] = data['beta_hat_se'][se_valid_idx][-1]
+                                final_betas_se[model][cond_name] = data[se_key][se_valid_idx][-1]
 
         if not final_betas:
             print("Warning: No final β̂ values to plot")
@@ -448,8 +545,8 @@ class Experiment2Plotter:
         ax.axhline(y=1, color='red', linestyle='--', linewidth=2, alpha=0.6, label='β=1 (critical)')
 
         ax.set_xlabel('Condition', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Final β̂ (spectral exponent)', fontsize=12, fontweight='bold')
-        ax.set_title('Final β̂ Across Ablation Conditions', fontsize=14, fontweight='bold')
+        ax.set_ylabel('Final β̂_med (spectral exponent)', fontsize=12, fontweight='bold')
+        ax.set_title('Final β̂_med Across Ablation Conditions', fontsize=14, fontweight='bold')
         ax.set_xticks(x_positions)
         ax.set_xticklabels([cond.replace('_', '\n') for cond in all_conditions],
                            fontsize=10, rotation=45, ha='right')

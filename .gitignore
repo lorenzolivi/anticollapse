@@ -12,7 +12,11 @@ build/
 
 # Generated experiment outputs
 results/
-diagnostics/results_*/
+results_smoke*/
+diagnostics/results*/
+diagnostics/drift_*/
+diagnostics/*_smoketest*/
+diagnostics/*_validation*/
 
 # LaTeX / Overleaf-managed paper sources
 latex/

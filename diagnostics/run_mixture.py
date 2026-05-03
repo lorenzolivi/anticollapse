@@ -99,11 +99,15 @@ def run_single(arch, opt_name, seed, args, device):
 
     # --- Per-neuron envelope f_q(ℓ) ---
     log(f"  computing per-neuron envelope at {len(lags)} lags...")
-    f_q = compute_per_neuron_envelope(model, X, diag_device, lags, batch_size=args.batch_size)
-    # f_q: (n_lags, H)
+    f_q, log_f_q = compute_per_neuron_envelope(model, X, diag_device, lags, batch_size=args.batch_size)
+    # f_q:     (n_lags, H) — E[|μ|], used for mixture construction
+    # log_f_q: (n_lags, H) — E[log|μ|], used for theory-matched τ extraction
 
     # --- Extract tau spectrum ---
-    tau, r2, mu_bar = extract_tau_spectrum(f_q, lags, fit_lag_min=args.fit_lag_min)
+    # Pass log_f_q so the fit uses E_t[log|μ^(q)|] directly, matching
+    # the theoretical definition of μ̄_q (eq. mu_asymptotic_decay_rate).
+    tau, r2, mu_bar = extract_tau_spectrum(f_q, lags, fit_lag_min=args.fit_lag_min,
+                                           log_f_q=log_f_q)
     valid_tau = np.isfinite(tau) & (tau > 0) & np.isfinite(r2)
     n_valid = valid_tau.sum()
     log(f"  tau extraction: {n_valid}/{args.H} neurons valid, "

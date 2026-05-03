@@ -58,6 +58,7 @@ from diagnostics import (
     log,
     run_checkpoint_diagnostics,
     compute_and_save_final_envelopes,
+    detect_threshold_crossing,
 )
 from seed_utils import write_csv, append_csv_row
 
@@ -105,11 +106,13 @@ TRAJ_COLS = [
     "alpha_hat", "alpha_ecf", "alpha_mcculloch",
     "sigma_alpha_hat", "alpha_hat_std", "alpha_hat_se", "alpha_agreement",
     "beta_hat", "beta_r2",
+    "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "beta_bootstrap_B_eff",
     "tau_mean", "tau_q90", "tau_q99",
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
     "beta_env", "beta_env_r2",
+    "phase_label",
 ]
 
 
@@ -207,6 +210,7 @@ def train_with_phase_tracking_ablation(
 
     nan_halt = False
     global_step = 0
+    trajectory_rows = []  # accumulate checkpoint rows for threshold-crossing detection
     for ep in range(1, int(args.epochs) + 1):
         model.train()
 
@@ -292,6 +296,7 @@ def train_with_phase_tracking_ablation(
                 alpha_winsorize_pct=current_winsorize,
             )
             append_csv_row(traj_csv, [row[k] for k in TRAJ_COLS])
+            trajectory_rows.append(row)
 
             # Save model checkpoint at warmup boundary
             if ep == warmup_epochs and warmup_epochs > 0:
@@ -303,6 +308,11 @@ def train_with_phase_tracking_ablation(
 
     if args.save_final_envelope and not nan_halt:
         # Final GELR envelope diagnostics need the live optimizer state.
+        # Also runs definitive phase classification (Table 1 with AIC).
+        # NOTE: the canonical final_phase.json is only emitted when
+        # --save_final_envelope is set.  Paper runs should always use
+        # this flag; otherwise only checkpoint-level (provisional)
+        # phase labels are available.
         log(f"[final:{model_name}] computing transport and GELR envelopes ...")
         compute_and_save_final_envelopes(
             model_name=model_name,
@@ -313,7 +323,31 @@ def train_with_phase_tracking_ablation(
             device=device,
             ells=ells,
             diag_batch_size=int(args.diag_batch_size),
+            fit_lags=fit_lags,
+            tau_ccdf_qmin=float(args.tau_ccdf_qmin),
+            tau_ccdf_qmax=float(args.tau_ccdf_qmax),
+            beta_bootstrap_B=int(args.beta_bootstrap_B),
+            beta_bootstrap_ci=float(args.beta_bootstrap_ci),
+            phase_r2_threshold=float(args.phase_r2_threshold),
         )
+
+    # Threshold-crossing detection
+    tcross = detect_threshold_crossing(trajectory_rows, persistence=2)
+    tcross_path = os.path.join(mdir, f"{model_name}_threshold_crossing.json")
+    with open(tcross_path, "w") as f:
+        json.dump(tcross, f, indent=2, default=str)
+    if tcross["crossed"]:
+        log(f"[tcross:{model_name}] threshold crossed at step "
+            f"{tcross['t_cross_step']} (epoch {tcross['t_cross_epoch']}), "
+            f"alpha={tcross['alpha_at_cross']}, "
+            f"beta_env={tcross['beta_env_at_cross']}")
+    elif tcross.get("left_censored"):
+        log(f"[tcross:{model_name}] already anti-collapsed at the first "
+            f"observed checkpoint (left-censored at step "
+            f"{tcross['first_observed_step']})")
+    else:
+        log(f"[tcross:{model_name}] never crossed threshold "
+            f"(right-censored at step {tcross['horizon_step']})")
 
     log(f"[train:{model_name}] done")
 
@@ -475,6 +509,16 @@ def parse_args():
     # CCDF tail fit
     p.add_argument("--tau_ccdf_qmin", type=float, default=0.75)
     p.add_argument("--tau_ccdf_qmax", type=float, default=0.995)
+
+    # Bootstrap β̂ over neuron population
+    p.add_argument("--beta_bootstrap_B", type=int, default=2000,
+                   help="Number of bootstrap resamples for beta stability interval")
+    p.add_argument("--beta_bootstrap_ci", type=float, default=0.90,
+                   help="Confidence level for bootstrap percentile interval")
+
+    # Phase classification
+    p.add_argument("--phase_r2_threshold", type=float, default=0.90,
+                   help="R² threshold for CCDF tail fit to be considered reliable")
 
     # Saving
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
