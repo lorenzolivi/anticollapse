@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Anti-Collapse — Experiment 2: Main orchestration script
-========================================================
+Anti-Collapse — Experiment 3 orchestration script
+=================================================
 
 Runs the full Stochastic Forcing Ablation experiment pipeline for multiple seeds:
   1) For each seed: for each condition, run the unified run_exp2.py
@@ -15,10 +15,10 @@ the intervention. Pass --warmup_epochs 0 (default) for from-scratch ablation.
 
 Usage:
   # From-scratch ablation (default)
-  python main_exp2.py --outdir results/exp2 --seeds 42,123,321
+  python main_exp2.py --outdir results/exp3_forcing --seeds 42,123,321
 
   # Warm-start ablation (250 epochs normal, then intervene)
-  python main_exp2.py --outdir results/exp2 --seeds 42,123,321 --warmup_epochs 250
+  python main_exp2.py --outdir results/exp3_forcing --seeds 42,123,321 --warmup_epochs 250
 
 This script calls run_exp2.py as a subprocess.
 
@@ -539,7 +539,7 @@ def parse_args():
 
     # output
     p.add_argument("--outdir", type=str, required=True,
-                   help="Root output directory (e.g., results/exp2)")
+                   help="Root output directory (e.g., results/exp3_forcing)")
 
     # seeds
     p.add_argument("--seeds", type=str, default="42,123,321",
@@ -590,6 +590,16 @@ def parse_args():
     p.add_argument("--task_lags", type=str, default="32,64,128,192,256")
     p.add_argument("--task_coeffs", type=str, default="0.6,0.5,0.4,0.32,0.26")
     p.add_argument("--noise_std", type=float, default=0.3)
+    p.add_argument("--task_variant", type=str, default="fixed",
+                   choices=["fixed", "heavy_tail"],
+                   help="fixed uses --task_lags/--task_coeffs; heavy_tail samples truncated-Pareto lags")
+    p.add_argument("--task_alpha", type=float, default=1.0)
+    p.add_argument("--task_lag_min", type=int, default=8)
+    p.add_argument("--task_lag_max", type=int, default=384)
+    p.add_argument("--task_K", type=int, default=8)
+    p.add_argument("--task_coeff_base", type=float, default=0.6)
+    p.add_argument("--task_coeff_decay", type=float, default=0.85)
+    p.add_argument("--task_lag_seed", type=int, default=20260410)
 
     p.add_argument("--diag_batch_size", type=int, default=256)
     p.add_argument("--checkpoint_every", type=int, default=50)
@@ -662,6 +672,14 @@ def build_common_args(args) -> Dict:
         "task_lags": args.task_lags,
         "task_coeffs": args.task_coeffs,
         "noise_std": args.noise_std,
+        "task_variant": args.task_variant,
+        "task_alpha": args.task_alpha,
+        "task_lag_min": args.task_lag_min,
+        "task_lag_max": args.task_lag_max,
+        "task_K": args.task_K,
+        "task_coeff_base": args.task_coeff_base,
+        "task_coeff_decay": args.task_coeff_decay,
+        "task_lag_seed": args.task_lag_seed,
         "diag_batch_size": args.diag_batch_size,
         "checkpoint_every": args.checkpoint_every,
         "alpha_n_grad_batches_ckpt": args.alpha_n_grad_batches_ckpt,
@@ -703,7 +721,7 @@ def main():
     opt_dir = os.path.join(args.outdir, args.optimizer)
     os.makedirs(opt_dir, exist_ok=True)
 
-    log(f"Experiment 2 orchestrator (Stochastic Forcing Ablation)")
+    log(f"Experiment 3 orchestrator (Stochastic Forcing Ablation)")
     log(f"Seeds: {seeds}")
     log(f"Output: {opt_dir}")
     if args.warmup_epochs > 0:

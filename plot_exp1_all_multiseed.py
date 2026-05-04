@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Multi-seed plotting driver — Experiment 1
-==========================================
+Multi-seed plotting driver — phase-trajectory engine
+====================================================
 
 Reads aggregated results (phase_trajectory_aggregated.csv with _mean/_se columns)
 and produces dynamics plots WITH ±1 SE error bands.
@@ -15,8 +15,8 @@ data copied into the aggregated directory).
 Typically called by main_exp1.py after aggregation, but can also be run standalone:
 
     python plot_exp1_all_multiseed.py \
-        --agg_dir results/exp1/adamw/aggregated \
-        --outdir  results/exp1/adamw/plots \
+        --agg_dir results/exp2_phase_full/adamw/aggregated \
+        --outdir  results/exp2_phase_full/adamw/plots \
         --dpi 600 --tau_cap 1e6
 """
 
@@ -614,7 +614,7 @@ STEP_TO_SCRIPT = {
 def main():
     ap = argparse.ArgumentParser(description="Multi-seed plotting driver for Experiment 1")
     ap.add_argument("--agg_dir", required=True,
-                    help="Aggregated results directory (e.g., results/exp1/adamw/aggregated)")
+                    help="Aggregated results directory (e.g., results/exp2_phase_full/adamw/aggregated)")
     ap.add_argument("--outdir", default=None,
                     help="Plot output directory (default: sibling plots/ dir)")
     ap.add_argument("--dpi", type=int, default=300)

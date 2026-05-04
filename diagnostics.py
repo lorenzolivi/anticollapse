@@ -548,7 +548,7 @@ def _safe_float(val):
 
 
 # ============================================================
-# Threshold localization in intervention space (Exp 2)
+# Threshold localization in intervention space (main-text Exp 3)
 # ============================================================
 
 def localize_threshold_bracket(

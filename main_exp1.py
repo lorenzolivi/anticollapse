@@ -2,16 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-Anti-Collapse — Experiment 1: Main orchestration script
-=========================================================
+Anti-Collapse — phase-trajectory orchestration engine
+=====================================================
 
-Runs the full experiment pipeline for multiple seeds:
+Runs the per-model phase-trajectory pipeline for multiple seeds:
   1) For each seed: run the unified run_exp1.py for all models
   2) After all seeds: aggregate phase trajectories across seeds (mean ± stderr)
   3) Run the plotting pipeline on the aggregated results
 
+In the current manuscript this engine is used by Experiment 1
+(ConstGate structural negative control; models=const) and Experiment 2
+(capacity ladder / dynamical phase trajectory; models selected by launcher).
+
 Usage:
-  python main_exp1.py --outdir results/exp1 --seeds 42,123,321
+  python main_exp1.py --outdir results/exp2_phase --seeds 42,123,321
 
 This script calls run_exp1.py as a subprocess.
 
@@ -493,7 +497,7 @@ def main():
 
     all_models = [m.strip().lower() for m in args.models.split(",") if m.strip()]
 
-    log(f"Experiment 1 orchestrator")
+    log(f"Phase-trajectory orchestrator")
     log(f"Seeds: {seeds}")
     log(f"Models: {all_models}")
     log(f"Output: {opt_dir}")

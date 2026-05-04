@@ -13,10 +13,15 @@ build/
 # Generated experiment outputs
 results/
 results_smoke*/
+
+# Generated diagnostics outputs (keep diagnostics code tracked)
 diagnostics/results*/
 diagnostics/drift_*/
 diagnostics/*_smoketest*/
 diagnostics/*_validation*/
+diagnostics/*_v[0-9]*/
+diagnostics/*_rerun*/
+diagnostics/output*/
 
 # LaTeX / Overleaf-managed paper sources
 latex/

@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Anti-Collapse — Experiment 1: Dynamical Phase Trajectory (Unified)
-====================================================================
+Anti-Collapse — phase-trajectory runner (single seed)
+=====================================================
 
 Trains all 5 gated RNN architectures (ConstGate, SharedGate, DiagGate, GRU, LSTM)
 on a synthetic long-memory regression task and tracks the dynamical trajectory
@@ -30,7 +30,7 @@ Top-level:
 NO plotting here.
 
 Usage:
-  python run_exp1.py --outdir results/exp1/seed_0042 --seed 42 --models const,shared,diag,gru,lstm
+  python run_exp1.py --outdir results/exp2_phase/seed_0042 --seed 42 --models shared,diag,gru,lstm
 """
 
 import argparse
@@ -335,7 +335,7 @@ def run_for_model(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Anti-Collapse Experiment 1: Dynamical Phase Trajectory"
+        description="Anti-Collapse phase-trajectory runner"
     )
 
     # Output / seeds

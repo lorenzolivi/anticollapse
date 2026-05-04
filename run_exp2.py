@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Anti-Collapse — Experiment 2: Stochastic Forcing Ablation (Unified)
-=====================================================================
+Anti-Collapse — Experiment 3: Stochastic Forcing Ablation (Unified)
+===================================================================
 
 Retrains anti-collapse architectures (DiagGate, GRU, LSTM) under interventions
 that suppress stochastic forcing, to causally demonstrate that heavy-tailed
@@ -18,7 +18,7 @@ Two modes:
      is suppressed after it has already emerged.
 
 Ablation conditions:
-  - baseline:          Standard Exp 1 hyperparameters (control)
+  - baseline:          Standard non-ablated training hyperparameters (control)
   - batch_ablation:    Massive batch sizes (suppress η_J → 0)
   - clip_ablation:     Aggressive gradient clipping (norm-based)
   - winsorize_ablation: Percentile-based gradient clipping (push α → 2)
@@ -27,15 +27,15 @@ Uses shared modules: models, transport, diagnostics, data.
 
 Usage:
   # From-scratch baseline
-  python run_exp2.py --outdir results/exp2/seed_0042 \\
+  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
     --condition baseline --seed 42
 
   # Batch ablation from scratch
-  python run_exp2.py --outdir results/exp2/seed_0042 \\
+  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
     --condition batch_ablation --ablation_values 2048,4096,8192
 
   # Warm-start winsorization (train normally for 250 epochs, then intervene)
-  python run_exp2.py --outdir results/exp2/seed_0042 \\
+  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
     --condition winsorize_ablation --ablation_values 95,90,80 \\
     --warmup_epochs 250
 """
@@ -53,7 +53,7 @@ import torch
 import torch.nn.functional as F
 
 from models import build_model, BaseRNN
-from data import make_dataset_cpu
+from data import make_dataset_cpu, sample_heavy_tailed_lags, build_task_coeffs
 from diagnostics import (
     log,
     run_checkpoint_diagnostics,
@@ -447,7 +447,7 @@ def run_for_condition(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Anti-Collapse Experiment 2: Stochastic Forcing Ablation"
+        description="Anti-Collapse Experiment 3: Stochastic Forcing Ablation"
     )
 
     # Output / seeds
@@ -487,6 +487,19 @@ def parse_args():
     p.add_argument("--task_lags", type=str, default="32,64,128,192,256")
     p.add_argument("--task_coeffs", type=str, default="0.6,0.5,0.4,0.32,0.26")
     p.add_argument("--noise_std", type=float, default=0.3)
+    p.add_argument("--task_variant", type=str, default="fixed",
+                   choices=["fixed", "heavy_tail"],
+                   help="fixed uses --task_lags/--task_coeffs; heavy_tail samples truncated-Pareto lags")
+    p.add_argument("--task_alpha", type=float, default=1.0,
+                   help="Tail index alpha_task for the heavy_tail task variant")
+    p.add_argument("--task_lag_min", type=int, default=8)
+    p.add_argument("--task_lag_max", type=int, default=384)
+    p.add_argument("--task_K", type=int, default=8,
+                   help="Number of target lags sampled in the heavy_tail task variant")
+    p.add_argument("--task_coeff_base", type=float, default=0.6)
+    p.add_argument("--task_coeff_decay", type=float, default=0.85)
+    p.add_argument("--task_lag_seed", type=int, default=20260410,
+                   help="Seed for sampling the lag set in the heavy_tail task variant")
 
     # Checkpointing
     p.add_argument("--diag_batch_size", type=int, default=256)
@@ -541,8 +554,25 @@ def parse_args():
                    choices=["auto", "cpu", "mps", "cuda"])
 
     args = p.parse_args()
-    args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip()]
-    args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip()]
+    if args.task_variant == "fixed":
+        args.task_lags = [int(s) for s in args.task_lags.split(",") if s.strip()]
+        args.task_coeffs = [float(s) for s in args.task_coeffs.split(",") if s.strip()]
+    elif args.task_variant == "heavy_tail":
+        rng = np.random.default_rng(args.task_lag_seed)
+        args.task_lags = sample_heavy_tailed_lags(
+            K=args.task_K,
+            lag_min=args.task_lag_min,
+            lag_max=args.task_lag_max,
+            alpha_task=args.task_alpha,
+            rng=rng,
+        )
+        args.task_coeffs = build_task_coeffs(
+            K=len(args.task_lags),
+            coeff_base=args.task_coeff_base,
+            coeff_decay=args.task_coeff_decay,
+        )
+    else:
+        raise ValueError(f"Unknown task_variant={args.task_variant}")
     assert len(args.task_lags) == len(args.task_coeffs)
     return args
 

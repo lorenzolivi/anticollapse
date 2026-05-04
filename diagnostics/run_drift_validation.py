@@ -6,7 +6,7 @@ Diagnostic 3 (runner): Far-tail drift-closure validation pipeline
 
 End-to-end pipeline that produces the empirical evidence for the
 far-left-tail closure F(ζ) = κ + o(1) used in the anti-collapse paper
-(Appendix: app:drift_validation).
+(Appendix: app:drift_structure).
 
 This is the *orchestrator* for Diagnostic 3. The core drift analysis lives
 in ``run_restoring_drift.py`` (same folder); this script wraps it with the
@@ -81,6 +81,19 @@ def _safe_float(value):
     return out if out == out else float("nan")
 
 
+TAILINESS_SWEEP = (1.6, 1.7, 1.8, 1.9)
+
+
+def _frac_key(thr: float) -> str:
+    return "alpha_per_dir_frac_below_" + ("%.1f" % thr).replace(".", "p")
+
+
+def _final_frac_key(thr: float) -> str:
+    return ("final_alpha_per_dir_frac_below_"
+            + ("%.1f" % thr).replace(".", "p")
+            + "_median")
+
+
 def summarize_alpha_projections(
     input_dir: str,
     model: str,
@@ -102,13 +115,13 @@ def summarize_alpha_projections(
        answers whether there are projection directions with heavy-tailed
        forcing.
     3. The directional tailiness fraction: the fraction of per-projection
-       estimates strictly below ``tailiness_threshold`` (default 1.8).
-       This collapses the directional distribution into a single
-       interpretable summary that is more stable than the per-projection
-       minimum.
-
-    The minimum per-projection value is also reported, but should be read
-    as a sensitivity flag rather than as an aggregate.
+       estimates strictly below ``tailiness_threshold`` (default 1.8),
+       reported alongside a sensitivity sweep at thresholds in
+       ``TAILINESS_SWEEP`` (1.6, 1.7, 1.8, 1.9). The primary cut at 1.8
+       sits a margin of 0.2 below the Gaussian boundary alpha=2; the
+       sweep documents that the directional verdict is not load-bearing
+       on the choice. The per-projection minimum is also reported but
+       should be read as a sensitivity flag rather than as an aggregate.
     """
     rows = []
     final_by_seed = {}
@@ -153,9 +166,16 @@ def summarize_alpha_projections(
                 amin = min(per_dir)
                 amax = max(per_dir)
                 frac_below = sum(1 for v in per_dir if v < tailiness_threshold) / len(per_dir)
+                frac_sweep = {
+                    _frac_key(thr): (
+                        sum(1 for v in per_dir if v < thr) / len(per_dir)
+                    )
+                    for thr in TAILINESS_SWEEP
+                }
             else:
                 med = q25 = q75 = mean = std = cv = amin = amax = float("nan")
                 frac_below = float("nan")
+                frac_sweep = {_frac_key(thr): float("nan") for thr in TAILINESS_SWEEP}
 
             mcc_boot_ci = data.get("alpha_mcc_boot_ci_pooled", [None, None]) or [None, None]
             mcc_boot_ci_lo = _safe_float(mcc_boot_ci[0]) if len(mcc_boot_ci) > 0 else float("nan")
@@ -189,6 +209,7 @@ def summarize_alpha_projections(
                 "alpha_per_dir_min": amin,
                 "alpha_per_dir_max": amax,
                 "alpha_per_dir_frac_below_threshold": frac_below,
+                **frac_sweep,
             }
             rows.append(row)
             if seed_name not in final_by_seed or epoch > final_by_seed[seed_name]["epoch"]:
@@ -219,6 +240,10 @@ def summarize_alpha_projections(
     final_per_dir_iqr = _finite([r["alpha_per_dir_iqr"] for r in final_rows])
     final_per_dir_min = _finite([r["alpha_per_dir_min"] for r in final_rows])
     final_per_dir_frac = _finite([r["alpha_per_dir_frac_below_threshold"] for r in final_rows])
+    final_per_dir_frac_sweep = {
+        thr: _finite([r[_frac_key(thr)] for r in final_rows])
+        for thr in TAILINESS_SWEEP
+    }
     final_mcc_ci_lo = _finite([r["alpha_mcc_boot_ci_lo"] for r in final_rows])
     final_mcc_ci_hi = _finite([r["alpha_mcc_boot_ci_hi"] for r in final_rows])
 
@@ -252,7 +277,11 @@ def summarize_alpha_projections(
             "dispersion is final_cross_projection_iqr_median; the stable "
             "directional summary is "
             "final_alpha_per_dir_frac_below_threshold_median (fraction "
-            "of projections with alpha_k < tailiness_threshold). The "
+            "of projections with alpha_k < tailiness_threshold), with "
+            "a sensitivity sweep over thresholds in "
+            "tailiness_threshold_sweep_values reported alongside as "
+            "final_alpha_per_dir_frac_below_<thr>_median (e.g. "
+            "final_alpha_per_dir_frac_below_1p6_median). The "
             "per-projection minimum is a sensitivity flag only. "
             "Optional: alpha_mcculloch is a bootstrap-weighted "
             "directional median computed by main_exp1.py and is "
@@ -292,6 +321,16 @@ def summarize_alpha_projections(
         "final_cross_projection_iqr_median": _quantile(final_per_dir_iqr, 0.50),
         "final_alpha_per_dir_min_median": _quantile(final_per_dir_min, 0.50),
         "final_alpha_per_dir_frac_below_threshold_median": _quantile(final_per_dir_frac, 0.50),
+        # Sensitivity sweep over the tailiness threshold. The primary cut
+        # is the configured `tailiness_threshold` field above (default
+        # 1.8); the sweep here documents that the directional verdict is
+        # not load-bearing on the specific choice. Each entry is the
+        # cross-seed median of the per-row fraction below the listed cut.
+        "tailiness_threshold_sweep_values": list(TAILINESS_SWEEP),
+        **{
+            _final_frac_key(thr): _quantile(final_per_dir_frac_sweep[thr], 0.50)
+            for thr in TAILINESS_SWEEP
+        },
         # Optional layer: bootstrap-weighted directional McCulloch
         # (alpha_mcculloch in main_exp1.py). This is DIFFERENT from
         # alpha_per_dir_median above; report only if explicitly labeled

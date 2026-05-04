@@ -24,6 +24,7 @@
 #   H, T, EPOCHS, CHECKPOINT_EVERY, NSEQ_TRAIN, NSEQ_DIAG
 #   TASK_ALPHA, TASK_K, TASK_LAG_MIN, TASK_LAG_MAX
 #   ALPHA_N_DIRECTIONS, ALPHA_N_GRAD_BATCHES, ALPHA_GRAD_BATCH_SIZE
+#   ALPHA_TAILINESS_THRESHOLD
 #   TAIL_Q_LOW_SWEEP, TAIL_Q_LOW_PRIMARY, TAIL_BOOTSTRAP_B
 
 set -euo pipefail
@@ -77,6 +78,7 @@ case "$MODE" in
         ;;
 esac
 
+ALPHA_TAILINESS_THRESHOLD="${ALPHA_TAILINESS_THRESHOLD:-1.8}"
 N_BINS="${N_BINS:-24}"
 LATE_FRACTION="${LATE_FRACTION:-0.35}"
 MIN_LATE_CHECKPOINTS="${MIN_LATE_CHECKPOINTS:-4}"
@@ -159,6 +161,7 @@ nohup bash -c '
             --alpha_n_directions "'"$ALPHA_N_DIRECTIONS"'" \
             --alpha_n_grad_batches_ckpt "'"$ALPHA_N_GRAD_BATCHES"'" \
             --alpha_grad_batch_size "'"$ALPHA_GRAD_BATCH_SIZE"'" \
+            --alpha_tailiness_threshold "'"$ALPHA_TAILINESS_THRESHOLD"'" \
             --tau_fit_lag_min "'"$TAU_FIT_LAG_MIN"'" \
             --tau_fit_lag_max "'"$TAU_FIT_LAG_MAX"'" \
             --tau_fit_num_lags "'"$TAU_FIT_NUM_LAGS"'" \

@@ -10,22 +10,21 @@ reconstructs
 
     zeta_q(t) = log(mu_bar_q(t)) = -log(tau_q(t)),
 
-and evaluates two empirical signatures of confinement in the late-training
-regime:
-
-For a linearized late-training drift of the form
-
-    F(zeta) ~= a - kappa * zeta,
-
-a restoring drift corresponds to kappa > 0, i.e. a negative slope of
-Delta zeta versus current zeta.
+and evaluates empirical signatures of late-training confinement and
+far-left-tail saturation.
 
 1. Conditional drift:
        F_hat(zeta) ~ E[Delta zeta | zeta_t ~= zeta]
    estimated by binning late-training transitions between consecutive
    checkpoints.
 
-2. Moment stabilization:
+2. Far-left-tail plateau:
+   on a populated tail slice {zeta <= zeta_q_low}, estimate the
+   trimmed plateau kappa_tail, residual tail slope, and constant-vs-linear
+   fit comparison. This is the diagnostic used for the drift-saturation
+   closure F(zeta) = kappa + o(1).
+
+3. Moment stabilization:
    the population mean and variance of zeta_q(t) across neurons should level
    off in late training rather than drift indefinitely.
 
@@ -46,9 +45,9 @@ Outputs:
 
 Example:
   python diagnostics/run_restoring_drift.py \
-      --input_dir results/exp1/adamw \
+      --input_dir results/exp2_phase_full/adamw \
       --model gru \
-      --outdir results/exp1/adamw/drift_validation_gru
+      --outdir results/exp2_phase_full/adamw/drift_validation_gru
 """
 
 import argparse

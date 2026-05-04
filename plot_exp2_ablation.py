@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plotting script for Experiment 2: Stochastic Forcing Ablation Study.
+Plotting script for Experiment 3: Stochastic Forcing Ablation Study.
 
 Generates publication-quality figures comparing phase trajectories (α̂, β̂) under
 different ablation conditions (batch size, gradient clipping, Winsorization) against
@@ -48,7 +48,10 @@ plt.rcParams.update({
 
 
 class Experiment2Plotter:
-    """Plotter for Experiment 2 ablation study."""
+    """Plotter for Experiment 3 ablation study.
+
+    The class name is kept for backward compatibility with older imports.
+    """
 
     def __init__(self, agg_dir: str, outdir: str, dpi: int = 300,
                  models: List[str] = None, tau_cap: float = 1e6):

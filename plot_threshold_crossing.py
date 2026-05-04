@@ -5,14 +5,15 @@
 Threshold-crossing and bracket visualization
 =============================================
 
-Reads threshold_crossing.json files (Exp 1) and threshold_brackets.json
-(Exp 2) from aggregated result directories and produces summary plots.
+Reads threshold_crossing.json files from the phase-trajectory experiment
+(main-text Experiment 2) and threshold_brackets.json from the forcing-ablation
+experiment (main-text Experiment 3), then produces summary plots.
 
 Can be run standalone:
 
     python plot_threshold_crossing.py \
-        --exp1_agg results/exp1/adamw/aggregated \
-        --exp2_agg results/exp2/adamw/aggregated \
+        --phase_agg results/exp2_phase_full/adamw/aggregated \
+        --ablation_agg results/exp3_forcing_full/adamw/aggregated \
         --outdir   results/plots/threshold \
         --dpi 300
 """
@@ -64,7 +65,7 @@ MODEL_COLORS = {
 
 
 # ============================================================
-# Exp 1: Threshold-crossing summary (bar chart of t_cross)
+# Main-text Exp 2: Threshold-crossing summary (bar chart of t_cross)
 # ============================================================
 
 def plot_threshold_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300):
@@ -103,7 +104,7 @@ def plot_threshold_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300):
         })
 
     if not model_records:
-        log("  No threshold-crossing data found for Exp 1, skipping plot.")
+        log("  No threshold-crossing data found for phase-trajectory experiment, skipping plot.")
         return
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -166,7 +167,7 @@ def plot_threshold_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300):
         fontsize=9,
     )
     ax.set_ylabel("Threshold-crossing step  $t_{\\mathrm{cross}}$", fontsize=10)
-    ax.set_title("Observed and censored threshold times (Exp 1)", fontsize=11)
+    ax.set_title("Observed and censored threshold times (Exp 2)", fontsize=11)
     ax.grid(axis="y", alpha=0.25)
     ax.set_ylim(0, max_step + 3.0 * text_pad)
 
@@ -194,7 +195,7 @@ def plot_threshold_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300):
 
 
 # ============================================================
-# Exp 1: Alpha and beta_env at crossing
+# Main-text Exp 2: Alpha and beta_env at crossing
 # ============================================================
 
 def plot_observables_at_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300):
@@ -232,7 +233,7 @@ def plot_observables_at_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300)
                label="$\\alpha=2$")
     ax.set_xlabel(r"$\hat{\alpha}(t_{\mathrm{cross}})$", fontsize=10)
     ax.set_ylabel(r"$\hat{\beta}_{\mathrm{env}}(t_{\mathrm{cross}})$", fontsize=10)
-    ax.set_title("Observables at threshold crossing (Exp 1)", fontsize=11)
+    ax.set_title("Observables at threshold crossing (Exp 2)", fontsize=11)
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
@@ -245,7 +246,7 @@ def plot_observables_at_crossing_exp1(agg_dir: str, outdir: str, dpi: int = 300)
 
 
 # ============================================================
-# Exp 2: Threshold brackets
+# Main-text Exp 3: Threshold brackets
 # ============================================================
 
 def plot_threshold_brackets_exp2(agg_dir: str, outdir: str, dpi: int = 300):
@@ -256,7 +257,7 @@ def plot_threshold_brackets_exp2(agg_dir: str, outdir: str, dpi: int = 300):
     brackets_path = os.path.join(agg_dir, "threshold_brackets.json")
     brackets = _load_json(brackets_path)
     if brackets is None:
-        log("  No threshold_brackets.json found for Exp 2, skipping plot.")
+        log("  No threshold_brackets.json found for forcing-ablation experiment, skipping plot.")
         return
 
     abl_types = set()
@@ -374,7 +375,7 @@ def plot_threshold_brackets_exp2(agg_dir: str, outdir: str, dpi: int = 300):
         if "batch" in abl_type:
             ax.set_xscale("log")
 
-    fig.suptitle("Threshold localization in intervention space (Exp 2)",
+    fig.suptitle("Threshold localization in intervention space (Exp 3)",
                  fontsize=12, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(outdir, "threshold_brackets_exp2.png"),
@@ -391,12 +392,12 @@ def plot_threshold_brackets_exp2(agg_dir: str, outdir: str, dpi: int = 300):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Plot threshold-crossing (Exp 1) and bracket (Exp 2) diagnostics"
+        description="Plot threshold-crossing (Exp 2) and bracket (Exp 3) diagnostics"
     )
-    p.add_argument("--exp1_agg", type=str, default=None,
-                   help="Path to Exp 1 aggregated directory")
-    p.add_argument("--exp2_agg", type=str, default=None,
-                   help="Path to Exp 2 aggregated directory")
+    p.add_argument("--phase_agg", "--exp1_agg", dest="phase_agg", type=str, default=None,
+                   help="Path to phase-trajectory aggregated directory (main-text Exp 2)")
+    p.add_argument("--ablation_agg", "--exp2_agg", dest="ablation_agg", type=str, default=None,
+                   help="Path to forcing-ablation aggregated directory (main-text Exp 3)")
     p.add_argument("--outdir", type=str, required=True,
                    help="Output directory for plots")
     p.add_argument("--dpi", type=int, default=300)
@@ -404,14 +405,14 @@ def main():
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    if args.exp1_agg:
-        log("Plotting Exp 1 threshold-crossing diagnostics ...")
-        plot_threshold_crossing_exp1(args.exp1_agg, args.outdir, args.dpi)
-        plot_observables_at_crossing_exp1(args.exp1_agg, args.outdir, args.dpi)
+    if args.phase_agg:
+        log("Plotting Exp 2 threshold-crossing diagnostics ...")
+        plot_threshold_crossing_exp1(args.phase_agg, args.outdir, args.dpi)
+        plot_observables_at_crossing_exp1(args.phase_agg, args.outdir, args.dpi)
 
-    if args.exp2_agg:
-        log("Plotting Exp 2 threshold brackets ...")
-        plot_threshold_brackets_exp2(args.exp2_agg, args.outdir, args.dpi)
+    if args.ablation_agg:
+        log("Plotting Exp 3 threshold brackets ...")
+        plot_threshold_brackets_exp2(args.ablation_agg, args.outdir, args.dpi)
 
     log("Done.")
 
