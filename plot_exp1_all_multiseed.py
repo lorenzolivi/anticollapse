@@ -12,7 +12,7 @@ For final-checkpoint plots (histograms, CCDFs, alpha stable fit), it delegates
 to the standard single-seed plotting scripts (which use the last-seed checkpoint
 data copied into the aggregated directory).
 
-Typically called by main_exp1.py after aggregation, but can also be run standalone:
+Typically called by main_phase_trajectory.py after aggregation, but can also be run standalone:
 
     python plot_exp1_all_multiseed.py \
         --agg_dir results/exp2_phase_full/adamw/aggregated \

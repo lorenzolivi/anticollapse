@@ -21,7 +21,7 @@ Outputs (per model directory):
   - checkpoint_tau_tail/ckpt_XXXX_tau_tail_fit.json
   - checkpoint_alpha/ckpt_XXXX_alpha_grad.json (+ samples csv)
 
-Optional final-only (set --save_final_envelope):
+Optional analysis-only (run later with --analysis_only):
   - <model>_envelope.csv, <model>_envelope_fit.json, <model>_envelope_fit_curves.csv
 
 Top-level:
@@ -30,7 +30,7 @@ Top-level:
 NO plotting here.
 
 Usage:
-  python run_exp1.py --outdir results/exp2_phase/seed_0042 --seed 42 --models shared,diag,gru,lstm
+  python run_phase_trajectory.py --outdir results/exp2_phase/seed_0042 --seed 42 --models shared,diag,gru,lstm
 """
 
 import argparse
@@ -54,6 +54,131 @@ from diagnostics import (
     detect_threshold_crossing,
 )
 from seed_utils import write_csv, append_csv_row
+
+
+# ============================================================
+# Heavy-tailed gradient-noise injection (Path A: enforced C1)
+# ============================================================
+#
+# Optional symmetric α-stable noise injection on the parameter gradients,
+# enabled by --inject_alpha_noise > 0. Intent: test C3 (capacity-realizability)
+# cleanly by enforcing α<2 on the effective forcing by construction, then
+# checking whether the constrained pair (e.g. ConstGate+AdamW) still fails
+# to broaden the spectrum. When --inject_alpha_noise == 0 (default), the
+# training loop is unchanged.
+
+def _stable_sample_symmetric(
+    alpha: float,
+    scale: float,
+    shape: torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Symmetric α-stable sample via Chambers-Mallows-Stuck.
+
+    Returns iid samples with characteristic function exp(-(scale*|t|)^alpha)
+    (β=0, location 0). For alpha=2 this is a Gaussian with standard
+    deviation sqrt(2)*scale; for alpha=1 it is a Cauchy with scale `scale`.
+
+    See Chambers, Mallows, Stuck (1976) and Nolan, "Univariate Stable
+    Distributions" (2020) for the construction.
+    """
+    if not (0.0 < alpha <= 2.0):
+        raise ValueError(f"alpha must be in (0, 2], got {alpha}")
+    pi = math.pi
+    eps = 1e-37
+    U = (torch.rand(shape, generator=generator, device=device, dtype=dtype) - 0.5) * pi
+    W = -torch.log(
+        torch.rand(shape, generator=generator, device=device, dtype=dtype).clamp_min(eps)
+    )
+    if abs(alpha - 1.0) < 1e-6:
+        X = torch.tan(U)  # symmetric Cauchy
+    else:
+        sin_aU = torch.sin(alpha * U)
+        cos_U = torch.cos(U).clamp_min(eps)
+        cos_au = torch.cos((alpha - 1.0) * U).clamp_min(eps)
+        X = (sin_aU / cos_U.pow(1.0 / alpha)) * (cos_au / W).pow((1.0 - alpha) / alpha)
+    return X.mul_(float(scale))
+
+
+def apply_alpha_stable_grad_injection(
+    model: torch.nn.Module,
+    alpha: float,
+    scale_multiplier: float,
+    generator: torch.Generator,
+) -> Dict[str, float]:
+    """Add symmetric α-stable noise to all trainable parameter gradients in place.
+
+    The per-parameter dispersion is
+        c_p = scale_multiplier * (||grad_p|| / sqrt(numel_p))
+    so the injection is self-calibrated to the natural per-element gradient
+    magnitude. When scale_multiplier=1 the injected noise has dispersion
+    comparable to the average per-element gradient, but with stability
+    index `alpha` instead of 2.
+
+    Returns a summary dict for logging.
+    """
+    if scale_multiplier <= 0.0:
+        return {"injected": 0.0}
+    n_params_injected = 0
+    total_disp = 0.0
+    n_elements_injected = 0
+    for p in model.parameters():
+        if not p.requires_grad or p.grad is None:
+            continue
+        g = p.grad
+        n = g.numel()
+        if n == 0:
+            continue
+        grad_norm = torch.linalg.vector_norm(g).item()
+        rms = grad_norm / max(math.sqrt(n), 1e-37)
+        c = float(scale_multiplier) * float(rms)
+        if c <= 0.0:
+            continue
+        noise = _stable_sample_symmetric(
+            alpha=alpha, scale=c, shape=g.shape,
+            device=g.device, dtype=g.dtype, generator=generator,
+        )
+        g.add_(noise)
+        n_params_injected += 1
+        total_disp += c * n
+        n_elements_injected += n
+    avg_disp = total_disp / max(1, n_elements_injected)
+    return {
+        "injected": 1.0,
+        "alpha": float(alpha),
+        "scale_multiplier": float(scale_multiplier),
+        "n_params_injected": float(n_params_injected),
+        "avg_dispersion_per_element": float(avg_disp),
+    }
+
+
+def _build_injection_generator(args, device: torch.device):
+    """Construct per-run RNG for stable-noise injection, or return None."""
+    if float(getattr(args, "inject_alpha_noise", 0.0)) <= 0.0:
+        return None
+    seed_offset = int(getattr(args, "inject_grad_seed_offset", 1729))
+    inj_seed = int(args.seed) + seed_offset
+    gen = torch.Generator(device=str(device))
+    gen.manual_seed(inj_seed)
+    return gen
+
+
+def _save_injection_metadata(mdir: str, args, info: Dict[str, float]) -> None:
+    """Persist injection settings to <mdir>/injection_metadata.json."""
+    if float(getattr(args, "inject_alpha_noise", 0.0)) <= 0.0:
+        return
+    out = {
+        "inject_alpha_noise": float(args.inject_alpha_noise),
+        "inject_alpha": float(args.inject_alpha),
+        "inject_grad_seed_offset": int(args.inject_grad_seed_offset),
+        "inject_seed_used": int(args.seed) + int(args.inject_grad_seed_offset),
+        "first_step_summary": info,
+    }
+    path = os.path.join(mdir, "injection_metadata.json")
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
 
 
 # ============================================================
@@ -111,6 +236,7 @@ TRAJ_COLS = [
     "beta_hat", "beta_r2",
     "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "beta_bootstrap_B_eff",
     "tau_mean", "tau_q90", "tau_q99",
+    "zeta_q10", "zeta_q90", "delta_zeta",
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
@@ -122,6 +248,48 @@ TRAJ_COLS = [
 # ============================================================
 # Training loop with phase tracking
 # ============================================================
+
+def build_optimizer_for_model(args, model: BaseRNN):
+    """Construct the optimizer used by the experiment."""
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(
+            model.parameters(), lr=args.lr, momentum=0.0,
+            weight_decay=args.weight_decay,
+        )
+    if args.optimizer == "sgd_momentum":
+        return torch.optim.SGD(
+            model.parameters(), lr=args.lr, momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    raise ValueError(f"Unknown optimizer {args.optimizer}")
+
+
+def save_analysis_checkpoint(
+    args,
+    model: BaseRNN,
+    optimizer: torch.optim.Optimizer,
+    model_name: str,
+    mdir: str,
+    epoch: int,
+    step: int,
+) -> None:
+    """Save final state needed by the later plotting/analysis pass."""
+    ckpt_dir = os.path.join(mdir, "analysis_checkpoint")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, "final.pt")
+    torch.save({
+        "model_name": model_name,
+        "epoch": int(epoch),
+        "step": int(step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+    }, ckpt_path)
+    log(f"[ckpt:{model_name}] saved final analysis checkpoint -> {ckpt_path}")
 
 def train_with_phase_tracking(
     args,
@@ -137,23 +305,7 @@ def train_with_phase_tracking(
 ) -> None:
     """Train model and run diagnostics at checkpoint epochs."""
 
-    # Optimizer setup
-    if args.optimizer == "adamw":
-        opt = torch.optim.AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-        )
-    elif args.optimizer == "sgd":
-        opt = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=0.0,
-            weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "sgd_momentum":
-        opt = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=args.momentum,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        raise ValueError(f"Unknown optimizer {args.optimizer}")
+    opt = build_optimizer_for_model(args, model)
 
     if args.orth_init:
         model.apply_orthogonal()
@@ -178,6 +330,16 @@ def train_with_phase_tracking(
 
     log(f"[train:{model_name}] start epochs={args.epochs} bs={bs} "
         f"opt={args.optimizer} lr={args.lr}")
+
+    # Heavy-tailed gradient-noise injection (Path A). Inactive when
+    # --inject_alpha_noise == 0 (the default).
+    injection_gen = _build_injection_generator(args, device)
+    if injection_gen is not None:
+        log(f"[train:{model_name}] heavy-tailed forcing injection ENABLED: "
+            f"alpha={float(args.inject_alpha):.3f}, "
+            f"scale_multiplier={float(args.inject_alpha_noise):.3g}, "
+            f"seed={int(args.seed) + int(args.inject_grad_seed_offset)}")
+    _inject_metadata_saved = False
 
     nan_halt = False
     global_step = 0
@@ -215,6 +377,21 @@ def train_with_phase_tracking(
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float(args.grad_clip)
                 )
+
+            # Heavy-tailed gradient-noise injection (Path A). Applied AFTER
+            # grad clipping so the heavy tail is not destroyed by a hard
+            # global norm cap. No-op when the generator is None.
+            if injection_gen is not None:
+                _inj_info = apply_alpha_stable_grad_injection(
+                    model=model,
+                    alpha=float(args.inject_alpha),
+                    scale_multiplier=float(args.inject_alpha_noise),
+                    generator=injection_gen,
+                )
+                if not _inject_metadata_saved:
+                    _save_injection_metadata(mdir, args, _inj_info)
+                    _inject_metadata_saved = True
+
             opt.step()
             global_step += 1
 
@@ -237,7 +414,7 @@ def train_with_phase_tracking(
             row = run_checkpoint_diagnostics(
                 args, model, model_name, mdir, ep,
                 Xtr_cpu, Ytr_cpu, Xdg_cpu,
-                device=device, fit_lags=fit_lags,
+                device=device, fit_lags=fit_lags, ells=ells,
                 step=global_step,
             )
             append_csv_row(traj_csv, [row[k] for k in TRAJ_COLS])
@@ -250,29 +427,10 @@ def train_with_phase_tracking(
                 os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                 torch.save(model.state_dict(), ckpt_path)
 
-    if args.save_final_envelope and not nan_halt:
-        # Final GELR envelope diagnostics need the live optimizer state.
-        # Also runs definitive phase classification (Table 1 with AIC).
-        # NOTE: the canonical final_phase.json is only emitted when
-        # --save_final_envelope is set.  Paper runs should always use
-        # this flag; otherwise only checkpoint-level (provisional)
-        # phase labels are available.
-        log(f"[final:{model_name}] computing transport and GELR envelopes ...")
-        compute_and_save_final_envelopes(
-            model_name=model_name,
-            model=model,
-            optimizer=opt,
-            mdir=mdir,
-            Xdg_cpu=Xdg_cpu,
-            device=device,
-            ells=ells,
-            diag_batch_size=int(args.diag_batch_size),
-            fit_lags=fit_lags,
-            tau_ccdf_qmin=float(args.tau_ccdf_qmin),
-            tau_ccdf_qmax=float(args.tau_ccdf_qmax),
-            beta_bootstrap_B=int(args.beta_bootstrap_B),
-            beta_bootstrap_ci=float(args.beta_bootstrap_ci),
-            phase_r2_threshold=float(args.phase_r2_threshold),
+    if args.save_analysis_checkpoint and not nan_halt:
+        save_analysis_checkpoint(
+            args, model, opt, model_name, mdir,
+            epoch=int(args.epochs), step=global_step,
         )
 
     # Threshold-crossing detection
@@ -329,6 +487,54 @@ def run_for_model(
     return {"ok": True}
 
 
+def analyze_final_envelope_for_model(
+    args,
+    model_name: str,
+    outdir: str,
+    Xdg_cpu: torch.Tensor,
+    device: torch.device,
+    ells: np.ndarray,
+    fit_lags: np.ndarray,
+) -> None:
+    """Load a final analysis checkpoint and compute final envelope verdicts."""
+    mdir = os.path.join(outdir, model_name)
+    ckpt_path = os.path.join(mdir, "analysis_checkpoint", "final.pt")
+    if not os.path.isfile(ckpt_path):
+        log(f"[analysis:{model_name}] missing analysis checkpoint: {ckpt_path}")
+        return
+
+    model = build_model(
+        model_name, args.D, args.H,
+        const_s=args.const_s, ln=args.layernorm,
+    ).to(device)
+    opt = build_optimizer_for_model(args, model)
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    opt.load_state_dict(ckpt["optimizer_state_dict"])
+
+    log(f"[analysis:{model_name}] computing final envelopes from {ckpt_path}")
+    compute_and_save_final_envelopes(
+        model_name=model_name,
+        model=model,
+        optimizer=opt,
+        mdir=mdir,
+        Xdg_cpu=Xdg_cpu,
+        device=device,
+        ells=ells,
+        diag_batch_size=int(args.diag_batch_size),
+        fit_lags=fit_lags,
+        tau_ccdf_qmin=float(args.tau_ccdf_qmin),
+        tau_ccdf_qmax=float(args.tau_ccdf_qmax),
+        beta_bootstrap_B=int(args.beta_bootstrap_B),
+        beta_bootstrap_ci=float(args.beta_bootstrap_ci),
+        phase_r2_threshold=float(args.phase_r2_threshold),
+        power_window_beta_min=float(args.power_window_beta_min),
+        power_window_min_points=int(args.power_window_min_points),
+        power_window_min_fraction=float(args.power_window_min_fraction),
+    )
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -362,6 +568,20 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
+
+    # Heavy-tailed gradient-noise injection (Path A: enforced C1).
+    # Set --inject_alpha_noise > 0 to enable. Noise is added per-element
+    # to all trainable parameter gradients AFTER grad clipping, with
+    # symmetric α-stable distribution of stability index --inject_alpha
+    # and dispersion = (--inject_alpha_noise) * (||grad_p||/sqrt(numel_p))
+    # per parameter.
+    p.add_argument("--inject_alpha_noise", type=float, default=0.0,
+                   help="Multiplier on per-parameter (||grad||/sqrt(numel)) for "
+                        "heavy-tailed gradient-noise injection. 0 disables (default).")
+    p.add_argument("--inject_alpha", type=float, default=1.6,
+                   help="Stability index α∈(0,2] of the injected α-stable noise.")
+    p.add_argument("--inject_grad_seed_offset", type=int, default=1729,
+                   help="Offset added to --seed for the injection RNG (reproducibility).")
 
     # Architecture
     p.add_argument("--const_s", type=float, default=0.005)
@@ -425,11 +645,22 @@ def parse_args():
     # Phase classification
     p.add_argument("--phase_r2_threshold", type=float, default=0.90,
                    help="R² threshold for CCDF tail fit to be considered reliable")
+    p.add_argument("--power_window_beta_min", type=float, default=0.10,
+                   help="Minimum envelope exponent for a visible power-law window")
+    p.add_argument("--power_window_min_points", type=int, default=8,
+                   help="Minimum lag-grid points in the power-law window")
+    p.add_argument("--power_window_min_fraction", type=float, default=0.05,
+                   help="Minimum fraction of lag-grid points in the power-law window")
 
-    # Saving
+    # Saving / later analysis
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
-    p.add_argument("--save_final_envelope", action="store_true")
+    p.add_argument("--save_final_envelope", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--save_analysis_checkpoint", action="store_true",
+                   help="Save final model+optimizer state for later plot/analysis pass")
     p.add_argument("--save_model_checkpoints", action="store_true")
+    p.add_argument("--analysis_only", action="store_true",
+                   help="Skip training and compute final envelope analysis from saved checkpoint")
 
     # Device
     p.add_argument("--device", type=str, default="cuda",
@@ -498,21 +729,31 @@ def main():
         Ytr_cpu = Ytr_cpu.pin_memory()
         Xdg_cpu = Xdg_cpu.pin_memory()
 
-    # Save metadata
-    with open(os.path.join(args.outdir, "cli_args.json"), "w") as jf:
-        json.dump(vars(args), jf, indent=2)
-    with open(os.path.join(args.outdir, "lag_grid.json"), "w") as jf:
-        json.dump({"ells": ells.tolist(), "tau_fit_lags": fit_lags.tolist()}, jf, indent=2)
+    # Save metadata for simulation runs.  Analysis-only passes should not
+    # rewrite the original data-collection manifest.
+    if not args.analysis_only:
+        with open(os.path.join(args.outdir, "cli_args.json"), "w") as jf:
+            json.dump(vars(args), jf, indent=2)
+        with open(os.path.join(args.outdir, "lag_grid.json"), "w") as jf:
+            json.dump({"ells": ells.tolist(), "tau_fit_lags": fit_lags.tolist()}, jf, indent=2)
 
-    # Run each model
+    # Run each model, or perform the deferred final-envelope analysis.
     models = [m.strip().lower() for m in args.models.split(",") if m.strip()]
     for mname in models:
-        log(f"[run] model={mname}")
-        run_for_model(
-            args, mname, args.outdir,
-            Xtr_cpu, Ytr_cpu, Xdg_cpu,
-            device=device, ells=ells, fit_lags=fit_lags,
-        )
+        if args.analysis_only:
+            log(f"[analysis] model={mname}")
+            analyze_final_envelope_for_model(
+                args, mname, args.outdir,
+                Xdg_cpu,
+                device=device, ells=ells, fit_lags=fit_lags,
+            )
+        else:
+            log(f"[run] model={mname}")
+            run_for_model(
+                args, mname, args.outdir,
+                Xtr_cpu, Ytr_cpu, Xdg_cpu,
+                device=device, ells=ells, fit_lags=fit_lags,
+            )
 
     log("Done.")
 

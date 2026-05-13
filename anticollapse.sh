@@ -45,14 +45,17 @@ usage() {
 anticollapse.sh - main-text Anti-Collapse experiment launcher
 
 Usage:
-    ./anticollapse.sh exp1 [smoke|full]   ConstGate structural negative control
-    ./anticollapse.sh exp2 [smoke|full]   phase trajectory / capacity ladder
-    ./anticollapse.sh exp3 [smoke|full]   stochastic-forcing ablation
-    ./anticollapse.sh all  [smoke|full]   run exp1, exp2, exp3 sequentially
-    ./anticollapse.sh --help              show this help
+    ./anticollapse.sh exp1        [smoke|full]   ConstGate structural negative control
+    ./anticollapse.sh exp1_inject [smoke|full]   Path A: ConstGate + α-stable forcing injection
+    ./anticollapse.sh exp2        [smoke|full]   phase trajectory / capacity ladder
+    ./anticollapse.sh exp3        [smoke|full]   stochastic-forcing ablation
+    ./anticollapse.sh all         [smoke|full]   run exp1, exp2, exp3 sequentially
+    ./anticollapse.sh --help                     show this help
 
 Examples:
     ./anticollapse.sh exp1 smoke
+    ./anticollapse.sh exp1_inject smoke
+    INJECT_ALPHA=1.4 INJECT_ALPHA_NOISE=2.0 ./anticollapse.sh exp1_inject full
     ./anticollapse.sh exp2 full
     EXP2_MODELS=diag,gru ./anticollapse.sh exp2 full
     EXP3_MODELS=diag EXP3_CONDITIONS=baseline,clip_ablation ./anticollapse.sh exp3 full
@@ -64,14 +67,15 @@ Profiles:
 Outputs default to results/ under the project root. Set RESULTS_DIR or OUTDIR
 to redirect all experiment folders.
 
-Runs launch in the background by default and create .log/.pid files next to
-the output directory. Set FOREGROUND=1 for an interactive foreground run.
+Runs launch simulations in the background by default and create .log/.pid files
+next to the output directory. Final envelope/regime analysis is deferred to
+plot_all.sh. Set FOREGROUND=1 for an interactive foreground run.
 EOF
     exit 0
 }
 
 case "$COMMAND" in
-    exp1|exp2|exp3|all|--help|-h|help|"") ;;
+    exp1|exp1_inject|exp2|exp3|all|--help|-h|help|"") ;;
     *)
         echo "Error: unknown command '$COMMAND'." >&2
         usage
@@ -84,7 +88,7 @@ fi
 
 case "$PROFILE" in
     smoke)
-        SEEDS="${SEEDS:-42}"
+        SEEDS="${SEEDS:-47}"
         H="${H:-256}"
         T="${T:-512}"
         D="${D:-16}"
@@ -108,7 +112,7 @@ case "$PROFILE" in
         WARMUP_EPOCHS="${WARMUP_EPOCHS:-40}"
         ;;
     full)
-        SEEDS="${SEEDS:-42,123,321,456,789}"
+        SEEDS="${SEEDS:-47,83,12,69,31}"
         H="${H:-512}"
         T="${T:-1280}"
         D="${D:-16}"
@@ -154,6 +158,9 @@ LAG_MAX="${LAG_MAX:-384}"
 NUM_LAGS="${NUM_LAGS:-128}"
 BETA_BOOTSTRAP_CI="${BETA_BOOTSTRAP_CI:-0.90}"
 PHASE_R2_THRESHOLD="${PHASE_R2_THRESHOLD:-0.90}"
+POWER_WINDOW_BETA_MIN="${POWER_WINDOW_BETA_MIN:-0.10}"
+POWER_WINDOW_MIN_POINTS="${POWER_WINDOW_MIN_POINTS:-8}"
+POWER_WINDOW_MIN_FRACTION="${POWER_WINDOW_MIN_FRACTION:-0.05}"
 TASK_COEFF_BASE="${TASK_COEFF_BASE:-0.6}"
 TASK_COEFF_DECAY="${TASK_COEFF_DECAY:-0.85}"
 TASK_LAG_SEED="${TASK_LAG_SEED:-20260410}"
@@ -162,9 +169,16 @@ SAVE_MODEL_CHECKPOINTS="${SAVE_MODEL_CHECKPOINTS:-0}"
 SKIP_PLOT="${SKIP_PLOT:-1}"
 
 EXP1_OUTDIR="${EXP1_OUTDIR:-$RESULTS_DIR/exp1_constgate_${PROFILE}}"
+EXP1_INJECT_OUTDIR="${EXP1_INJECT_OUTDIR:-$RESULTS_DIR/exp1_constgate_inject_${PROFILE}}"
 EXP2_OUTDIR="${EXP2_OUTDIR:-$RESULTS_DIR/exp2_phase_${PROFILE}}"
 EXP3_OUTDIR="${EXP3_OUTDIR:-$RESULTS_DIR/exp3_forcing_${PROFILE}}"
 ALL_RUN_STEM="${ALL_RUN_STEM:-$RESULTS_DIR/anticollapse_all_${PROFILE}}"
+
+# Heavy-tailed gradient-noise injection (Path A) settings. Used only when
+# COMMAND == exp1_inject. INJECT_ALPHA_NOISE=0 disables (no-op); >0 enables.
+INJECT_ALPHA_NOISE="${INJECT_ALPHA_NOISE:-1.0}"
+INJECT_ALPHA="${INJECT_ALPHA:-1.6}"
+INJECT_GRAD_SEED_OFFSET="${INJECT_GRAD_SEED_OFFSET:-1729}"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -206,11 +220,14 @@ common_exp_args=(
     --beta_bootstrap_B "$BETA_BOOTSTRAP_B"
     --beta_bootstrap_ci "$BETA_BOOTSTRAP_CI"
     --phase_r2_threshold "$PHASE_R2_THRESHOLD"
+    --power_window_beta_min "$POWER_WINDOW_BETA_MIN"
+    --power_window_min_points "$POWER_WINDOW_MIN_POINTS"
+    --power_window_min_fraction "$POWER_WINDOW_MIN_FRACTION"
     --device "$DEVICE"
     --dpi "$DPI"
     --orth_init
     --save_checkpoint_ccdf
-    --save_final_envelope
+    --save_analysis_checkpoint
 )
 
 if [[ "$SKIP_PLOT" == "1" || "$SKIP_PLOT" == "true" ]]; then
@@ -231,6 +248,12 @@ launcher_artifacts() {
             RUN_LOGFILE="${EXP1_OUTDIR}.log"
             RUN_PIDFILE="${EXP1_OUTDIR}.pid"
             TARGET_DIRS=("$EXP1_OUTDIR")
+            ;;
+        exp1_inject)
+            RUN_LABEL="Experiment 1 (Path A): ConstGate with α-stable forcing injection"
+            RUN_LOGFILE="${EXP1_INJECT_OUTDIR}.log"
+            RUN_PIDFILE="${EXP1_INJECT_OUTDIR}.pid"
+            TARGET_DIRS=("$EXP1_INJECT_OUTDIR")
             ;;
         exp2)
             RUN_LABEL="Experiment 2: dynamical phase trajectory"
@@ -293,9 +316,26 @@ run_exp1() {
     echo "Experiment 1: ConstGate structural negative control"
     echo "============================================================"
     echo "outdir: $EXP1_OUTDIR"
-    run_python "$SCRIPT_DIR/main_exp1.py" \
+    run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP1_OUTDIR" \
         --models const \
+        "${common_exp_args[@]}"
+}
+
+run_exp1_inject() {
+    echo "============================================================"
+    echo "Experiment 1 (Path A): ConstGate with α-stable forcing injection"
+    echo "============================================================"
+    echo "outdir:               $EXP1_INJECT_OUTDIR"
+    echo "inject_alpha_noise:   $INJECT_ALPHA_NOISE"
+    echo "inject_alpha:         $INJECT_ALPHA"
+    echo "inject_grad_seed_off: $INJECT_GRAD_SEED_OFFSET"
+    run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
+        --outdir "$EXP1_INJECT_OUTDIR" \
+        --models const \
+        --inject_alpha_noise "$INJECT_ALPHA_NOISE" \
+        --inject_alpha "$INJECT_ALPHA" \
+        --inject_grad_seed_offset "$INJECT_GRAD_SEED_OFFSET" \
         "${common_exp_args[@]}"
 }
 
@@ -309,7 +349,7 @@ run_exp2() {
     if [[ "$SAVE_MODEL_CHECKPOINTS" == "1" || "$SAVE_MODEL_CHECKPOINTS" == "true" ]]; then
         exp2_args+=(--save_model_checkpoints)
     fi
-    run_python "$SCRIPT_DIR/main_exp1.py" \
+    run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP2_OUTDIR" \
         --models "$EXP2_MODELS" \
         "${exp2_args[@]}"
@@ -322,7 +362,7 @@ run_exp3() {
     echo "models: $EXP3_MODELS"
     echo "conditions: $EXP3_CONDITIONS"
     echo "outdir: $EXP3_OUTDIR"
-    run_python "$SCRIPT_DIR/main_exp2.py" \
+    run_python "$SCRIPT_DIR/main_forcing_ablation.py" \
         --outdir "$EXP3_OUTDIR" \
         --models "$EXP3_MODELS" \
         --conditions "$EXP3_CONDITIONS" \
@@ -369,6 +409,9 @@ echo "results: $RESULTS_DIR"
 case "$COMMAND" in
     exp1)
         run_exp1
+        ;;
+    exp1_inject)
+        run_exp1_inject
         ;;
     exp2)
         run_exp2

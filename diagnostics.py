@@ -351,6 +351,7 @@ def classify_phase(
     beta_lo: float,
     beta_hi: float,
     r2_threshold: float = 0.90,
+    power_law_window_pass: Optional[bool] = None,
 ) -> str:
     """
     Operational phase-classification rule (Table 1 in the paper).
@@ -365,12 +366,22 @@ def classify_phase(
         beta_lo: lower bound of bootstrap stability interval
         beta_hi: upper bound of bootstrap stability interval
         r2_threshold: goodness-of-fit threshold for CCDF tail
+        power_law_window_pass: explicit power-law-window gate from
+            crossover_residual_diagnostic.  If False, the run is
+            classified as collapsed even if a flexible tempered fit
+            wins by information criterion.
 
     Returns:
         phase label string
     """
-    # Step 1: exponential envelope wins
-    if envelope_winner == "exponential":
+    # Step 1: a sustained power-law window must be visible in the
+    # envelope itself.  This prevents the tempered model from winning
+    # AIC by absorbing small exponential-envelope wobble while carrying
+    # a degenerate algebraic factor.
+    if power_law_window_pass is not None:
+        if not bool(power_law_window_pass):
+            return "collapsed"
+    elif envelope_winner == "exponential":
         return "collapsed"
 
     # Step 2: non-exponential but poor tail fit
@@ -474,6 +485,7 @@ def detect_threshold_crossing(
             first_observed_step=None, first_observed_epoch=None,
             first_observed_phase=None,
             horizon_step=0,
+            horizon_epoch=0,
         )
 
     first_row = trajectory[0]
@@ -481,6 +493,7 @@ def detect_threshold_crossing(
     first_observed_epoch = int(first_row.get("epoch", 0))
     first_observed_phase = str(first_row.get("phase_label", ""))
     horizon_step = int(trajectory[-1].get("step", 0))
+    horizon_epoch = int(trajectory[-1].get("epoch", 0))
     anti_flags = [
         _phase_state_from_label(row.get("phase_label", "")) == "anti_collapsed"
         for row in trajectory
@@ -499,6 +512,7 @@ def detect_threshold_crossing(
             first_observed_epoch=first_observed_epoch,
             first_observed_phase=first_observed_phase,
             horizon_step=horizon_step,
+            horizon_epoch=horizon_epoch,
         )
 
     for i in range(1, n - persistence + 1):
@@ -521,6 +535,7 @@ def detect_threshold_crossing(
                 first_observed_epoch=first_observed_epoch,
                 first_observed_phase=first_observed_phase,
                 horizon_step=horizon_step,
+                horizon_epoch=horizon_epoch,
             )
 
     return dict(
@@ -533,6 +548,7 @@ def detect_threshold_crossing(
         first_observed_epoch=first_observed_epoch,
         first_observed_phase=first_observed_phase,
         horizon_step=horizon_step,
+        horizon_epoch=horizon_epoch,
     )
 
 
@@ -736,7 +752,14 @@ def compute_macro_envelope(
     diag_batch_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute macro envelope f(ℓ) = E_{seq,t} mean_q |mu_tl_q(ℓ)|.
+    Compute macro envelope f(ℓ) = E_{seq,t} mean_q |mu0_q(ℓ)|.
+
+    Uses the zero-order diagonal kernel mu0 only.  The first-order
+    Taylor correction mu1 = mu0 · Σ ratio grows linearly in ℓ and can
+    flip the sign of d f / d ℓ when mu0 decays slowly (e.g. a frozen
+    ConstGate with leak ≈ 0.995), so it is excluded from the canonical
+    envelope.  See compute_macro_envelope_comparison for the audit
+    variant that retains mu0+mu1.
 
     Returns:
         f_mean: (n_ells,) average envelope values
@@ -761,14 +784,14 @@ def compute_macro_envelope(
 
             prefix_cache = {}
             for j, ell in enumerate(ells):
-                _mu0, _mu1, mu_tl = compute_mu_tl_for_lag(
+                mu0, _mu1, _mu_tl = compute_mu_tl_for_lag(
                     model_name, intermediates, int(ell),
                     out_dtype=intermediates["leak"].dtype,
                     _prefix_cache=prefix_cache,
                 )
-                if mu_tl.numel() == 0:
+                if mu0.numel() == 0:
                     continue
-                abs_f = torch.abs(mu_tl).double()
+                abs_f = torch.abs(mu0).double()
                 mass_per_seq = abs_f.mean(dim=2).mean(dim=1)  # (B,)
                 sum_mass[j] += float(mass_per_seq.sum().item())
                 sum_log_mass[j] += float(
@@ -942,6 +965,21 @@ def compute_macro_envelope_comparison(
 ) -> Dict[str, object]:
     """
     Compute both the transport-only and GELR-weighted macro envelopes.
+
+    Canonical envelope semantics (2026-05):
+        f(ℓ) = E_{b,t} mean_q |mu0_{q}(b, t, ℓ)|
+    where mu0 is the zero-order diagonal kernel (product of |λ| ≤ 1
+    factors).  By construction mu0 is monotone non-increasing in ℓ in
+    expectation, so the envelope is a clean macroscopic observable.
+
+    The first-order Jacobian correction mu1 = mu0 · Σ ratio (a Taylor
+    expansion of the off-diagonal contribution) is *not* added to the
+    canonical envelope, because Σ ratio grows linearly in ℓ and breaks
+    monotonicity when mu0 decays slowly (e.g. a frozen-gate ConstGate
+    with leak ≈ 0.995).  We still track ||mu1|| / ||mu0|| as a
+    diagnostic (`corr_ratio`) and expose the legacy mu0+mu1 envelope as
+    `f_transport_with_correction` so audits and comparisons against
+    earlier runs remain possible.
     """
     model.eval()
     Btot, _, _ = Xdg_cpu.shape
@@ -961,10 +999,15 @@ def compute_macro_envelope_comparison(
     fallback_mean = float(np.mean(lambda_rowmean))
     fallback_sq_mean = float(np.mean(lambda_rowmean ** 2))
 
-    sum_transport = np.zeros(len(ells), dtype=np.float64)
+    sum_transport = np.zeros(len(ells), dtype=np.float64)            # mu0 (canonical)
     sum_log_transport = np.zeros(len(ells), dtype=np.float64)
-    sum_gelr = np.zeros(len(ells), dtype=np.float64)
+    sum_transport_corr = np.zeros(len(ells), dtype=np.float64)       # mu0+mu1 (audit)
+    sum_log_transport_corr = np.zeros(len(ells), dtype=np.float64)
+    sum_mu1_abs = np.zeros(len(ells), dtype=np.float64)              # for corr_ratio
+    sum_gelr = np.zeros(len(ells), dtype=np.float64)                 # mu0 GELR (canonical)
     sum_log_gelr = np.zeros(len(ells), dtype=np.float64)
+    sum_gelr_corr = np.zeros(len(ells), dtype=np.float64)            # mu0+mu1 GELR (audit)
+    sum_log_gelr_corr = np.zeros(len(ells), dtype=np.float64)
     sum_lambda_mean = np.zeros(len(ells), dtype=np.float64)
     sum_lambda_sq = np.zeros(len(ells), dtype=np.float64)
     count_lambda = np.zeros(len(ells), dtype=np.float64)
@@ -980,24 +1023,37 @@ def compute_macro_envelope_comparison(
 
             prefix_cache = {}
             for j, ell in enumerate(ells):
-                _mu0, _mu1, mu_tl = compute_mu_tl_for_lag(
+                mu0, mu1, mu_tl = compute_mu_tl_for_lag(
                     model_name, intermediates, int(ell),
                     out_dtype=intermediates["leak"].dtype,
                     _prefix_cache=prefix_cache,
                 )
-                if mu_tl.numel() == 0:
+                if mu0.numel() == 0:
                     continue
 
-                abs_transport = torch.abs(mu_tl).double()
-                mass_transport = abs_transport.mean(dim=2).mean(dim=1)
-                sum_transport[j] += float(mass_transport.sum().item())
+                # Canonical: zero-order kernel only.
+                abs_mu0 = torch.abs(mu0).double()
+                mass_mu0 = abs_mu0.mean(dim=2).mean(dim=1)
+                sum_transport[j] += float(mass_mu0.sum().item())
                 sum_log_transport[j] += float(
-                    torch.log(mass_transport.clamp(min=1e-30)).sum().item()
+                    torch.log(mass_mu0.clamp(min=1e-30)).sum().item()
                 )
+
+                # Audit: zero+first-order kernel (legacy envelope).
+                abs_mu_tl = torch.abs(mu_tl).double()
+                mass_mu_tl = abs_mu_tl.mean(dim=2).mean(dim=1)
+                sum_transport_corr[j] += float(mass_mu_tl.sum().item())
+                sum_log_transport_corr[j] += float(
+                    torch.log(mass_mu_tl.clamp(min=1e-30)).sum().item()
+                )
+
+                # First-order correction magnitude.
+                abs_mu1 = torch.abs(mu1).double()
+                sum_mu1_abs[j] += float(abs_mu1.mean(dim=2).mean(dim=1).sum().item())
 
                 if use_lag_dependent:
                     lambda_ell = compute_lag_dependent_rates(
-                        lambda_matrix, hseq, mu_tl.shape[1], lambda_rowmean_t
+                        lambda_matrix, hseq, mu0.shape[1], lambda_rowmean_t
                     )
                     lam_flat = lambda_ell.detach().float()
                     lam_mean = float(lam_flat.mean().item())
@@ -1005,16 +1061,25 @@ def compute_macro_envelope_comparison(
                     n_lam = int(lam_flat.numel())
                 else:
                     lambda_ell = lambda_rowmean_t.view(1, 1, -1)
-                    n_lam = int(mu_tl.shape[0] * mu_tl.shape[1] * mu_tl.shape[2])
+                    n_lam = int(mu0.shape[0] * mu0.shape[1] * mu0.shape[2])
                     lam_mean = fallback_mean
                     lam_sq = fallback_sq_mean
 
-                mu_gelr = mu_tl * lambda_ell.to(mu_tl.dtype)
-                abs_gelr = torch.abs(mu_gelr).double()
-                mass_gelr = abs_gelr.mean(dim=2).mean(dim=1)
-                sum_gelr[j] += float(mass_gelr.sum().item())
+                lambda_cast = lambda_ell.to(mu0.dtype)
+                mu_gelr0 = mu0 * lambda_cast
+                abs_gelr0 = torch.abs(mu_gelr0).double()
+                mass_gelr0 = abs_gelr0.mean(dim=2).mean(dim=1)
+                sum_gelr[j] += float(mass_gelr0.sum().item())
                 sum_log_gelr[j] += float(
-                    torch.log(mass_gelr.clamp(min=1e-30)).sum().item()
+                    torch.log(mass_gelr0.clamp(min=1e-30)).sum().item()
+                )
+
+                mu_gelr_corr = mu_tl * lambda_cast
+                abs_gelr_corr = torch.abs(mu_gelr_corr).double()
+                mass_gelr_corr = abs_gelr_corr.mean(dim=2).mean(dim=1)
+                sum_gelr_corr[j] += float(mass_gelr_corr.sum().item())
+                sum_log_gelr_corr[j] += float(
+                    torch.log(mass_gelr_corr.clamp(min=1e-30)).sum().item()
                 )
 
                 sum_lambda_mean[j] += lam_mean * n_lam
@@ -1024,20 +1089,40 @@ def compute_macro_envelope_comparison(
         count_seq += int(xb.shape[0])
         del xb, hseq, intermediates
 
-    f_transport = sum_transport / max(1, count_seq)
-    log_f_transport = sum_log_transport / max(1, count_seq)
-    f_gelr = sum_gelr / max(1, count_seq)
-    log_f_gelr = sum_log_gelr / max(1, count_seq)
+    seq_norm = max(1, count_seq)
+    f_transport = sum_transport / seq_norm
+    log_f_transport = sum_log_transport / seq_norm
+    f_transport_corr = sum_transport_corr / seq_norm
+    log_f_transport_corr = sum_log_transport_corr / seq_norm
+    f_mu1_abs = sum_mu1_abs / seq_norm
+    f_gelr = sum_gelr / seq_norm
+    log_f_gelr = sum_log_gelr / seq_norm
+    f_gelr_corr = sum_gelr_corr / seq_norm
+    log_f_gelr_corr = sum_log_gelr_corr / seq_norm
+
+    # corr_ratio = ||mu1||_1 / ||mu0||_1 per lag — diagnoses validity of
+    # the first-order Taylor expansion.  When this approaches 1 the
+    # legacy mu0+mu1 envelope is no longer trustworthy.
+    corr_ratio = f_mu1_abs / np.maximum(f_transport, 1e-30)
 
     lambda_mean = sum_lambda_mean / np.maximum(count_lambda, 1.0)
     lambda_var = (sum_lambda_sq / np.maximum(count_lambda, 1.0)) - (lambda_mean ** 2)
     lambda_std = np.sqrt(np.maximum(lambda_var, 0.0))
 
     return {
+        # Canonical (mu0) envelope — what the paper claims as f(ℓ).
         "f_transport": f_transport.astype(np.float64),
         "log_f_transport": log_f_transport.astype(np.float64),
         "f_gelr": f_gelr.astype(np.float64),
         "log_f_gelr": log_f_gelr.astype(np.float64),
+        # Audit diagnostics — legacy mu0+mu1 envelope and correction ratio.
+        "f_transport_with_correction": f_transport_corr.astype(np.float64),
+        "log_f_transport_with_correction": log_f_transport_corr.astype(np.float64),
+        "f_gelr_with_correction": f_gelr_corr.astype(np.float64),
+        "log_f_gelr_with_correction": log_f_gelr_corr.astype(np.float64),
+        "first_order_correction_ratio": corr_ratio.astype(np.float64),
+        "envelope_kernel_order": "zero_order_mu0",
+        # GELR metadata (unchanged).
         "lambda_mean": lambda_mean.astype(np.float64),
         "lambda_std": lambda_std.astype(np.float64),
         "lambda_rowmean": lambda_rowmean.astype(np.float64),
@@ -1065,12 +1150,15 @@ def compute_and_save_final_envelopes(
     beta_bootstrap_B: int = 2000,
     beta_bootstrap_ci: float = 0.90,
     phase_r2_threshold: float = 0.90,
+    power_window_beta_min: float = 0.10,
+    power_window_min_points: int = 8,
+    power_window_min_fraction: float = 0.05,
 ) -> Dict[str, object]:
     """
     Save the transport-only envelope bundle plus GELR-weighted comparison
     files.  If a tau spectrum is provided (or fit_lags are given so one
     can be extracted), also performs the definitive phase classification
-    using the full AIC-based envelope comparison (Table 1 in the paper).
+    using the full envelope decision rule (Table 1 in the paper).
     """
     env = compute_macro_envelope_comparison(
         model_name=model_name,
@@ -1088,8 +1176,15 @@ def compute_and_save_final_envelopes(
     log_f_for_fit = np.log(np.maximum(env["f_transport"], 1e-30))
     fit_transport = fit_log_envelope_exp_and_power(ells, log_f_for_fit)
 
-    # Residual-based crossover diagnostic around ℓ* (Section 7)
-    crossover_diag = crossover_residual_diagnostic(ells, log_f_for_fit, fit_transport)
+    # Residual-based power-law-window / crossover diagnostic (Section 7).
+    crossover_diag = crossover_residual_diagnostic(
+        ells,
+        log_f_for_fit,
+        fit_transport,
+        beta_min=power_window_beta_min,
+        min_window_points=power_window_min_points,
+        min_window_fraction=power_window_min_fraction,
+    )
     fit_transport["crossover_diagnostic"] = crossover_diag
 
     write_csv(
@@ -1102,6 +1197,48 @@ def compute_and_save_final_envelopes(
     )
     with open(os.path.join(mdir, f"{model_name}_envelope_fit.json"), "w") as jf:
         json.dump(fit_transport, jf, indent=2)
+
+    # Audit-only diagnostic: legacy mu0+mu1 envelope and first-order
+    # correction ratio.  The first-order Jacobian correction
+    # mu1 = mu0 · Σ ratio grows linearly in ℓ, so when corr_ratio
+    # approaches 1 the legacy envelope is no longer trustworthy.
+    f_corr = np.asarray(
+        env.get(
+            "f_transport_with_correction",
+            np.full_like(env["f_transport"], np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
+    log_f_corr = np.log(np.maximum(f_corr, 1e-30))
+    corr_ratio = np.asarray(
+        env.get(
+            "first_order_correction_ratio",
+            np.full_like(env["f_transport"], np.nan, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
+    write_csv(
+        os.path.join(mdir, f"{model_name}_envelope_audit.csv"),
+        [
+            "ell",
+            "f_mu0",
+            "log_f_mu0",
+            "f_mu0_plus_mu1",
+            "log_f_mu0_plus_mu1",
+            "corr_ratio_mu1_over_mu0",
+        ],
+        [
+            [int(e), float(f0), float(lf0), float(fc), float(lfc), float(cr)]
+            for e, f0, lf0, fc, lfc, cr in zip(
+                ells,
+                env["f_transport"],
+                log_f_for_fit,
+                f_corr,
+                log_f_corr,
+                corr_ratio,
+            )
+        ],
+    )
 
     log_f_exp, log_f_pow, log_f_temp = eval_envelope_fit_curves(
         ells, fit_transport, include_tempered=True
@@ -1125,6 +1262,8 @@ def compute_and_save_final_envelopes(
 
     # Same correction for GELR: fit against log(E[·]) not E[log(·)]
     log_f_gelr_for_fit = np.log(np.maximum(env["f_gelr"], 1e-30))
+    f_gelr_corr = np.asarray(env["f_gelr_with_correction"], dtype=np.float64)
+    log_f_gelr_corr = np.log(np.maximum(f_gelr_corr, 1e-30))
     fit_gelr = fit_log_envelope_exp_and_power(ells, log_f_gelr_for_fit)
     write_csv(
         os.path.join(mdir, f"{model_name}_gelr_envelope_compare.csv"),
@@ -1134,6 +1273,11 @@ def compute_and_save_final_envelopes(
             "log_f_transport",
             "f_gelr",
             "log_f_gelr",
+            "f_transport_with_correction",
+            "log_f_transport_with_correction",
+            "f_gelr_with_correction",
+            "log_f_gelr_with_correction",
+            "first_order_correction_ratio",
             "geomean_log_transport",
             "geomean_log_gelr",
             "lambda_mean",
@@ -1141,13 +1285,19 @@ def compute_and_save_final_envelopes(
         ],
         [
             [int(e), float(ft), float(lft), float(fg), float(lfg),
+             float(ftc), float(lftc), float(fgc), float(lfgc), float(cr),
              float(glt), float(glg), float(lm), float(ls)]
-            for e, ft, lft, fg, lfg, glt, glg, lm, ls in zip(
+            for e, ft, lft, fg, lfg, ftc, lftc, fgc, lfgc, cr, glt, glg, lm, ls in zip(
                 ells,
                 env["f_transport"],
                 log_f_for_fit,       # log(E[·]) — correct observable
                 env["f_gelr"],
                 log_f_gelr_for_fit,  # log(E[·]) — correct observable
+                f_corr,
+                log_f_corr,
+                f_gelr_corr,
+                log_f_gelr_corr,
+                env["first_order_correction_ratio"],
                 env["log_f_transport"],  # E[log(·)] — geometric mean, diagnostic
                 env["log_f_gelr"],       # E[log(·)] — geometric mean, diagnostic
                 env["lambda_mean"],
@@ -1159,6 +1309,7 @@ def compute_and_save_final_envelopes(
     with open(os.path.join(mdir, f"{model_name}_gelr_fit.json"), "w") as jf:
         json.dump({
             "gelr_mode": env["gelr_mode"],
+            "envelope_kernel_order": env.get("envelope_kernel_order", "zero_order_mu0"),
             "used_lag_dependent_rates": env["used_lag_dependent_rates"],
             "recurrent_matrices": env["recurrent_matrices"],
             "lambda_rowmean_min": float(np.min(env["lambda_rowmean"])),
@@ -1205,11 +1356,23 @@ def compute_and_save_final_envelopes(
         )
 
     if tau is not None:
-        # Step 1: envelope winner from AIC (already computed)
+        # Envelope winner is still recorded, but the phase gate below is
+        # controlled by the sustained power-law-window diagnostic.
         _winner = fit_transport.get("envelope_winner", "tempered")
 
         # Step 2+: CCDF tail fit and bootstrap
         _tail = fit_tau_ccdf_powerlaw(tau, qmin=tau_ccdf_qmin, qmax=tau_ccdf_qmax)
+        tau_safe_final = np.asarray(tau, dtype=np.float64)
+        tau_safe_final = tau_safe_final[np.isfinite(tau_safe_final) & (tau_safe_final > 0)]
+        if tau_safe_final.size > 0:
+            zeta_final = -np.log(tau_safe_final)
+            zeta_q10 = float(np.quantile(zeta_final, 0.10))
+            zeta_q90 = float(np.quantile(zeta_final, 0.90))
+            delta_zeta = float(zeta_q90 - zeta_q10)
+        else:
+            zeta_q10 = float("nan")
+            zeta_q90 = float("nan")
+            delta_zeta = float("nan")
         _boot = bootstrap_beta_ccdf(
             tau, qmin=tau_ccdf_qmin, qmax=tau_ccdf_qmax,
             B=beta_bootstrap_B, ci_level=beta_bootstrap_ci,
@@ -1221,6 +1384,7 @@ def compute_and_save_final_envelopes(
             beta_lo=float(_boot.get("beta_lo", float("nan"))),
             beta_hi=float(_boot.get("beta_hi", float("nan"))),
             r2_threshold=phase_r2_threshold,
+            power_law_window_pass=bool(crossover_diag.get("power_law_window_pass", False)),
         )
 
         final_phase_info = {
@@ -1234,8 +1398,14 @@ def compute_and_save_final_envelopes(
             "boot_beta_hi": float(_boot.get("beta_hi", float("nan"))),
             "boot_p_beta_lt1": float(_boot.get("p_beta_lt1", float("nan"))),
             "boot_B_effective": int(_boot.get("B_effective", 0)),
+            "zeta_q10": zeta_q10,
+            "zeta_q90": zeta_q90,
+            "delta_zeta": delta_zeta,
             "ell_star": float(fit_transport.get("tempered", {}).get("ell_star", float("nan"))),
             "phase_r2_threshold": phase_r2_threshold,
+            "power_window_beta_min": float(power_window_beta_min),
+            "power_window_min_points": int(power_window_min_points),
+            "power_window_min_fraction": float(power_window_min_fraction),
             "crossover_diagnostic": crossover_diag,
         }
 
@@ -1377,16 +1547,19 @@ def crossover_residual_diagnostic(
     ells: np.ndarray,
     log_mu: np.ndarray,
     fit: Dict,
+    beta_min: float = 0.10,
+    min_window_points: int = 8,
+    min_window_fraction: float = 0.05,
 ) -> Dict:
-    """Residual-based crossover diagnostic around ℓ* (Section 7).
+    """Residual-based power-law-window / crossover diagnostic (Section 7).
 
-    For anti-collapsed runs the paper promises:
-      • residuals of the tempered power-law fit are *structureless* below ℓ*
-        (tested via Wald–Wolfowitz runs test on residual signs);
-      • residuals are *exponentially dominated* above ℓ*
-        (tested by checking that residuals w.r.t. pure power-law fit are
-         systematically negative — a one-sided sign test via
-         ``scipy.stats.binomtest``).
+    For an anti-collapsed verdict, the envelope must contain a sustained
+    power-law window.  This is stricter than accepting a non-exponential
+    AIC winner: the tempered model nests degenerate limits and can win
+    by absorbing minor exponential-envelope wobble.  We therefore require
+    a non-degenerate power-law exponent, enough lag-grid points in the
+    power-law shoulder, and structureless residuals of the pure power-law
+    fit on that shoulder.
 
     For collapsed / sub-threshold runs (ℓ* undefined or the envelope winner
     is "exponential"), we instead test whether the exponential envelope
@@ -1406,7 +1579,12 @@ def crossover_residual_diagnostic(
     ells = ells[mask]
     log_mu = log_mu[mask]
 
-    result: Dict = {"valid": False}
+    result: Dict = {
+        "valid": False,
+        "power_window_beta_min": float(beta_min),
+        "power_window_min_points": int(min_window_points),
+        "power_window_min_fraction": float(min_window_fraction),
+    }
 
     if ells.size < 6 or not fit:
         return result
@@ -1414,6 +1592,12 @@ def crossover_residual_diagnostic(
     tempered = fit.get("tempered", {})
     ell_star = tempered.get("ell_star", float("nan"))
     winner = fit.get("envelope_winner", "tempered")
+    power = fit.get("power", {})
+
+    min_required_points = int(max(
+        int(min_window_points),
+        math.ceil(float(min_window_fraction) * float(ells.size)),
+    ))
 
     # --- Helper: Wald–Wolfowitz runs test (two-sided, normal approx) ---
     # scipy does not include a one-sample runs test, so we use the
@@ -1426,10 +1610,16 @@ def crossover_residual_diagnostic(
     #   Var[R] = 2 n+ n- (2 n+ n- - n) / (n^2 (n-1))
     def _runs_test(residuals: np.ndarray):
         """Return (n_runs, z_stat, p_value_two_sided)."""
-        signs = (residuals >= 0).astype(int)
-        n = len(signs)
+        residuals = np.asarray(residuals, dtype=float)
+        residuals = residuals[np.isfinite(residuals)]
+        n = len(residuals)
         if n < 8:
             return (float("nan"), float("nan"), float("nan"))
+        max_abs = float(np.max(np.abs(residuals)))
+        if max_abs <= 1.0e-10:
+            # A numerically exact fit has no residual structure to reject.
+            return (1.0, 0.0, 1.0)
+        signs = (residuals >= 0).astype(int)
         n_pos = int(signs.sum())
         n_neg = n - n_pos
         if n_pos == 0 or n_neg == 0:
@@ -1463,67 +1653,127 @@ def crossover_residual_diagnostic(
         p = float(binomtest(n_neg, n, 0.5, alternative="greater").pvalue)
         return (float(n_neg), float(n), float(p))
 
+    log_ell = np.log(ells + 1e-12)
+    d_p = float(power.get("d", 0.0))
+    beta_power = float(max(0.0, -d_p)) if np.isfinite(d_p) else float("nan")
+    beta_tempered = float(tempered.get("beta_env", float("nan")))
+
+    def _local_power_residuals(idx: np.ndarray):
+        """Fit a power law on the candidate window and return residuals.
+
+        The primary window test asks whether the observed envelope is
+        locally power-law-like on the shoulder itself.  For tempered
+        envelopes this should not reuse the global pure-power fit, which
+        is intentionally contaminated by the cutoff region.
+        """
+        idx = np.asarray(idx, dtype=bool)
+        if int(idx.sum()) < 2:
+            return (
+                np.asarray([], dtype=float),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+            )
+        x = log_ell[idx]
+        y = log_mu[idx]
+        slope, intercept = np.polyfit(x, y, 1)
+        pred = intercept + slope * x
+        residuals = y - pred
+        ss_res = float(np.sum(residuals ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+        beta_local = float(max(0.0, -slope))
+        return residuals, beta_local, float(intercept), float(slope), r2
+
     # ------------------------------------------------------------------
-    # Branch 1: anti-collapsed (ℓ* is finite, lies well inside the lag
-    # window, and the envelope winner is not purely exponential).
-    #
-    # We guard against the degenerate case where the tempered fit returns
-    # a mathematically positive but physically meaningless ℓ* (e.g. smaller
-    # than the smallest observed lag, or so large that almost all points
-    # fall on one side).  In those cases neither the below-ℓ* runs test
-    # nor the above-ℓ* sign test has enough data, so we fall through to
-    # the collapsed-mode branch, which applies the broad-window exponential
-    # envelope check instead.
-    min_pts_per_side = 4
-    ell_star_in_range = (
-        np.isfinite(ell_star)
-        and ell_star > 0
-        and ell_star >= float(np.min(ells))
-        and ell_star <= float(np.max(ells))
+    # Branch 1: explicit power-law-window gate.
+    # ------------------------------------------------------------------
+    idx_window = np.zeros_like(ells, dtype=bool)
+    idx_above = np.zeros_like(ells, dtype=bool)
+    window_source = "none"
+    window_beta = float("nan")
+    fallthrough_reason = ""
+
+    if winner == "power":
+        # Pure power is the tau_max -> infinity limit of the tempered
+        # interpolant, so the observable power-law window is the full lag grid.
+        idx_window = np.ones_like(ells, dtype=bool)
+        idx_above = np.zeros_like(ells, dtype=bool)
+        window_source = "pure_power"
+        window_beta = beta_power
+    elif winner == "tempered":
+        ell_star_in_range = (
+            np.isfinite(ell_star)
+            and ell_star > 0
+            and ell_star >= float(np.min(ells))
+        )
+        if ell_star_in_range:
+            idx_window = ells <= ell_star
+            idx_above = ells > ell_star
+            window_source = "tempered_below_ell_star"
+            window_beta = beta_tempered
+        else:
+            fallthrough_reason = "ell_star_undefined_or_out_of_range"
+    elif winner == "exponential":
+        fallthrough_reason = "exponential_winner"
+    else:
+        fallthrough_reason = f"unknown_winner:{winner}"
+
+    n_window = int(idx_window.sum())
+    beta_pass = bool(np.isfinite(window_beta) and window_beta > float(beta_min))
+    size_pass = bool(n_window >= min_required_points)
+    resid_window, beta_local, intercept_local, slope_local, r2_local = _local_power_residuals(idx_window)
+    runs_window = _runs_test(resid_window) if n_window > 0 else (
+        float("nan"), float("nan"), float("nan")
     )
-    if ell_star_in_range and winner != "exponential":
-        _n_below = int(np.sum(ells <= ell_star))
-        _n_above = int(np.sum(ells > ell_star))
-        if _n_below < min_pts_per_side or _n_above < min_pts_per_side:
-            ell_star_in_range = False
+    runs_window_pass = bool(np.isfinite(runs_window[2]) and runs_window[2] > 0.05)
+    power_law_window_pass = bool(
+        winner in {"power", "tempered"}
+        and beta_pass
+        and size_pass
+        and runs_window_pass
+    )
 
-    if ell_star_in_range and winner != "exponential":
-        # Tempered-fit predicted values
-        log_ell = np.log(ells + 1e-12)
-        a_t = tempered.get("a", 0.0)
-        d_t = tempered.get("d_log", 0.0)
-        b_t = tempered.get("b_ell", 0.0)
-        pred_temp = a_t + d_t * log_ell + b_t * ells
-        resid_temp = log_mu - pred_temp
-
-        # Power-law fit predicted values (for above-ℓ* sign test)
-        pfit = fit.get("power", {})
-        c_p = pfit.get("c", 0.0)
-        d_p = pfit.get("d", 0.0)
-        pred_pow = c_p + d_p * log_ell
-        resid_pow = log_mu - pred_pow
-
-        idx_below = ells <= ell_star
-        idx_above = ells > ell_star
-
-        runs_below = _runs_test(resid_temp[idx_below])
-        sign_above = _sign_test_negative(resid_pow[idx_above])
+    if power_law_window_pass:
+        if int(idx_above.sum()) >= 4 and np.isfinite(intercept_local) and np.isfinite(slope_local):
+            resid_above = log_mu[idx_above] - (intercept_local + slope_local * log_ell[idx_above])
+        else:
+            resid_above = np.asarray([], dtype=float)
+        sign_above = _sign_test_negative(resid_above) if int(idx_above.sum()) >= 4 else (
+            float("nan"), float("nan"), float("nan")
+        )
 
         result = {
             "valid": True,
             "mode": "anti_collapsed",
-            "ell_star": float(ell_star),
-            "n_below": int(idx_below.sum()),
+            "envelope_winner": str(winner),
+            "window_source": window_source,
+            "power_law_window_pass": True,
+            "power_window_beta": float(window_beta),
+            "power_window_local_beta": float(beta_local) if np.isfinite(beta_local) else None,
+            "power_window_local_r2": float(r2_local) if np.isfinite(r2_local) else None,
+            "power_window_beta_min": float(beta_min),
+            "power_window_beta_pass": bool(beta_pass),
+            "power_window_n_points": int(n_window),
+            "power_window_min_required_points": int(min_required_points),
+            "power_window_size_pass": bool(size_pass),
+            "ell_star": float(ell_star) if np.isfinite(ell_star) else None,
+            "n_below": int(idx_window.sum()),
             "n_above": int(idx_above.sum()),
-            # Below ℓ*: tempered-fit residuals should be structureless
-            "runs_below_n_runs": runs_below[0],
-            "runs_below_z": runs_below[1],
-            "runs_below_p": runs_below[2],
-            "runs_below_pass": bool(
-                np.isfinite(runs_below[2]) and runs_below[2] > 0.05
-            ),
-            # Above ℓ*: power-law residuals should be systematically negative
-            # (exponential cutoff pulls data below pure power-law)
+            # Power-law-window residuals should be structureless.
+            "runs_power_window_n_runs": runs_window[0],
+            "runs_power_window_z": runs_window[1],
+            "runs_power_window_p": runs_window[2],
+            "runs_power_window_pass": bool(runs_window_pass),
+            # Backward-compatible aliases used by existing plotting code.
+            "runs_below_n_runs": runs_window[0],
+            "runs_below_z": runs_window[1],
+            "runs_below_p": runs_window[2],
+            "runs_below_pass": bool(runs_window_pass),
+            # Above ℓ*: residuals relative to the local shoulder fit should be
+            # systematically negative if an exponential cutoff is visible.
+            # This is diagnostic, not part of the primary window gate.
             "sign_above_n_neg": sign_above[0],
             "sign_above_n_total": sign_above[1],
             "sign_above_p": sign_above[2],
@@ -1545,19 +1795,35 @@ def crossover_residual_diagnostic(
 
         runs_exp = _runs_test(resid_exp)
 
-        # Record why we fell into this branch: either the envelope winner
-        # is genuinely exponential, or ℓ* was out of range / degenerate.
-        if winner == "exponential":
-            fallthrough_reason = "exponential_winner"
-        elif not np.isfinite(ell_star) or ell_star <= 0:
-            fallthrough_reason = "ell_star_undefined"
-        else:
-            fallthrough_reason = "ell_star_out_of_range"
+        if not fallthrough_reason:
+            failed = []
+            if not beta_pass:
+                failed.append("beta_window_degenerate")
+            if not size_pass:
+                failed.append("window_too_short")
+            if not runs_window_pass:
+                failed.append("power_window_residual_structure")
+            fallthrough_reason = "+".join(failed) if failed else "power_window_failed"
 
         result = {
             "valid": True,
             "mode": "collapsed",
             "fallthrough_reason": fallthrough_reason,
+            "envelope_winner": str(winner),
+            "window_source": window_source,
+            "power_law_window_pass": False,
+            "power_window_beta": float(window_beta) if np.isfinite(window_beta) else None,
+            "power_window_local_beta": float(beta_local) if np.isfinite(beta_local) else None,
+            "power_window_local_r2": float(r2_local) if np.isfinite(r2_local) else None,
+            "power_window_beta_min": float(beta_min),
+            "power_window_beta_pass": bool(beta_pass),
+            "power_window_n_points": int(n_window),
+            "power_window_min_required_points": int(min_required_points),
+            "power_window_size_pass": bool(size_pass),
+            "runs_power_window_n_runs": runs_window[0],
+            "runs_power_window_z": runs_window[1],
+            "runs_power_window_p": runs_window[2],
+            "runs_power_window_pass": bool(runs_window_pass),
             "ell_star": float(ell_star) if np.isfinite(ell_star) else None,
             "r2_exp": float(r2_exp),
             "runs_exp_n_runs": runs_exp[0],
@@ -1637,6 +1903,68 @@ def _grad_projection_sample(
     return float(s.item())
 
 
+def _stable_sample_symmetric_for_diagnostics(
+    alpha: float,
+    scale: float,
+    shape: torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Symmetric α-stable sample used to mirror injected update forcing."""
+    if not (0.0 < alpha <= 2.0):
+        raise ValueError(f"alpha must be in (0, 2], got {alpha}")
+    eps = 1e-37
+    U = (torch.rand(shape, generator=generator, device=device, dtype=dtype) - 0.5) * math.pi
+    W = -torch.log(
+        torch.rand(shape, generator=generator, device=device, dtype=dtype).clamp_min(eps)
+    )
+    if abs(alpha - 1.0) < 1e-6:
+        X = torch.tan(U)
+    else:
+        sin_aU = torch.sin(alpha * U)
+        cos_U = torch.cos(U).clamp_min(eps)
+        cos_au = torch.cos((alpha - 1.0) * U).clamp_min(eps)
+        X = (sin_aU / cos_U.pow(1.0 / alpha)) * (cos_au / W).pow((1.0 - alpha) / alpha)
+    return X.mul_(float(scale))
+
+
+def _apply_diagnostic_alpha_stable_injection(
+    model: nn.Module,
+    alpha: float,
+    scale_multiplier: float,
+    generator: torch.Generator,
+) -> None:
+    """Add the same per-parameter α-stable forcing used during injected training.
+
+    This is used only for the alpha diagnostic in injected-forcing runs.  The
+    model parameters are not updated here; we modify the temporary gradients so
+    the projected samples represent the actual noisy update forcing rather than
+    the raw loss-gradient distribution.
+    """
+    if scale_multiplier <= 0.0:
+        return
+    for p in model.parameters():
+        if (not p.requires_grad) or p.grad is None:
+            continue
+        g = p.grad
+        n = g.numel()
+        if n == 0:
+            continue
+        rms = torch.linalg.vector_norm(g).item() / max(math.sqrt(n), 1e-37)
+        scale = float(scale_multiplier) * float(rms)
+        if scale <= 0.0:
+            continue
+        g.add_(_stable_sample_symmetric_for_diagnostics(
+            alpha=alpha,
+            scale=scale,
+            shape=g.shape,
+            device=g.device,
+            dtype=g.dtype,
+            generator=generator,
+        ))
+
+
 def _collect_grad_projections(
     model: nn.Module,
     X_cpu: torch.Tensor,
@@ -1647,9 +1975,16 @@ def _collect_grad_projections(
     w_seed: int,
     grad_clip: float = 0.0,
     winsorize_pct: Optional[float] = None,
+    inject_alpha_noise: float = 0.0,
+    inject_alpha: float = 1.6,
+    inject_generator: Optional[torch.Generator] = None,
 ) -> np.ndarray:
     """
-    Collect gradient projection samples onto a single random direction.
+    Collect gradient/update-forcing projection samples onto one random direction.
+
+    When inject_alpha_noise > 0, mirror the training-time α-stable gradient
+    injection before projection.  This makes the alpha diagnostic report the
+    effective noisy update forcing for Path A runs, not just the raw gradients.
 
     Returns: 1-D array of shape (n_grad_batches,).
     """
@@ -1686,6 +2021,14 @@ def _collect_grad_projections(
             if grad_clip and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
 
+            if inject_alpha_noise > 0.0 and inject_generator is not None:
+                _apply_diagnostic_alpha_stable_injection(
+                    model,
+                    alpha=float(inject_alpha),
+                    scale_multiplier=float(inject_alpha_noise),
+                    generator=inject_generator,
+                )
+
             samples[i] = _grad_projection_sample(model, w_unit)
             del xb, yb, yhat, loss
 
@@ -1708,6 +2051,7 @@ def run_checkpoint_diagnostics(
     Xdg_cpu: torch.Tensor,
     device: torch.device,
     fit_lags: np.ndarray,
+    ells: Optional[np.ndarray] = None,
     step: Optional[int] = None,
     alpha_batch_size_override: Optional[int] = None,
     alpha_grad_clip_override: Optional[float] = None,
@@ -1737,10 +2081,16 @@ def run_checkpoint_diagnostics(
     #   4. Report both estimates; flag agreement as reliability indicator
     K = int(getattr(args, 'alpha_n_directions', 5))
     n_grad_batches = int(args.alpha_n_grad_batches_ckpt)
+    inject_alpha_noise = float(getattr(args, "inject_alpha_noise", 0.0))
+    inject_alpha = float(getattr(args, "inject_alpha", 1.6))
+    inject_seed_offset = int(getattr(args, "inject_grad_seed_offset", 1729))
+    injection_forcing_enabled = inject_alpha_noise > 0.0
     if alpha_grad_clip_override is not None:
         gc = float(alpha_grad_clip_override)
     else:
-        gc = float(args.grad_clip) if args.alpha_use_grad_clip else 0.0
+        # In injected-forcing runs the diagnostic should mirror the actual
+        # update forcing, where injection happens after training-time clipping.
+        gc = float(args.grad_clip) if (args.alpha_use_grad_clip or injection_forcing_enabled) else 0.0
     if alpha_batch_size_override is not None:
         bs_alpha = int(alpha_batch_size_override)
     else:
@@ -1752,12 +2102,25 @@ def run_checkpoint_diagnostics(
     sid = 0
     for k_dir in range(K):
         dir_seed = int(args.w_seed) + k_dir
+        inject_generator = None
+        if injection_forcing_enabled:
+            inject_seed = (
+                int(args.seed)
+                + inject_seed_offset
+                + 1000003 * int(epoch)
+                + 9176 * int(k_dir)
+            )
+            inject_generator = torch.Generator(device=device)
+            inject_generator.manual_seed(inject_seed)
         samp_k = _collect_grad_projections(
             model, Xtr_cpu, Ytr_cpu,
             device=device, batch_size=bs_alpha,
             n_grad_batches=n_grad_batches,
             w_seed=dir_seed, grad_clip=gc,
             winsorize_pct=alpha_winsorize_pct,
+            inject_alpha_noise=inject_alpha_noise,
+            inject_alpha=inject_alpha,
+            inject_generator=inject_generator,
         )
         samp_k = samp_k - float(np.mean(samp_k))
         per_dir_samples.append(samp_k)
@@ -1926,6 +2289,10 @@ def run_checkpoint_diagnostics(
         "alpha_mcc_mean_ci_width": mcc_mean_ci_width,
         "alpha_reliable": alpha_reliable,
         "alpha_method": alpha_method_used,
+        "alpha_forcing_injection_applied": bool(injection_forcing_enabled),
+        "alpha_forcing_injection_scale": float(inject_alpha_noise),
+        "alpha_forcing_injection_alpha": float(inject_alpha),
+        "alpha_forcing_gradient_clip": float(gc),
         "grad_proj_mean": float(np.mean([r[2] for r in sample_rows])),
         "grad_proj_std": float(np.std([r[2] for r in sample_rows])),
         "n_samples": len(sample_rows),
@@ -1998,6 +2365,22 @@ def run_checkpoint_diagnostics(
         "epoch": int(epoch),
         "model": str(model_name),
     })
+    tau_safe = np.asarray(tau, dtype=np.float64)
+    tau_safe = tau_safe[np.isfinite(tau_safe) & (tau_safe > 0)]
+    if tau_safe.size > 0:
+        zeta = -np.log(tau_safe)
+        zeta_q10 = float(np.quantile(zeta, 0.10))
+        zeta_q90 = float(np.quantile(zeta, 0.90))
+        delta_zeta = float(zeta_q90 - zeta_q10)
+    else:
+        zeta_q10 = float("nan")
+        zeta_q90 = float("nan")
+        delta_zeta = float("nan")
+    tail.update({
+        "zeta_q10": zeta_q10,
+        "zeta_q90": zeta_q90,
+        "delta_zeta": delta_zeta,
+    })
     tail_dir = os.path.join(mdir, "checkpoint_tau_tail")
     os.makedirs(tail_dir, exist_ok=True)
     with open(os.path.join(tail_dir, f"{ckpt_tag}_tau_tail_fit.json"), "w") as jf:
@@ -2017,39 +2400,37 @@ def run_checkpoint_diagnostics(
     with open(os.path.join(boot_dir, f"{ckpt_tag}_beta_bootstrap.json"), "w") as jf:
         json.dump(_json_safe(boot), jf, indent=2)
 
-    # --- Envelope-β consistency ---
-    env_info = envelope_beta_from_tau_spectrum(tau)
+    # --- Checkpoint-level envelope and power-law-window gate ---
+    env_ells = np.asarray(ells if ells is not None else fit_lags, dtype=float)
+    f_tau = np.mean(np.exp(-np.outer(env_ells, 1.0 / tau_safe)), axis=1) \
+        if tau_safe.size > 0 else np.full_like(env_ells, np.nan, dtype=float)
+    log_f_tau = np.log(np.maximum(f_tau, 1e-30))
+    env_fit = fit_log_envelope_exp_and_power(env_ells, log_f_tau)
+    crossover_diag = crossover_residual_diagnostic(
+        env_ells,
+        log_f_tau,
+        env_fit,
+        beta_min=float(getattr(args, 'power_window_beta_min', 0.10)),
+        min_window_points=int(getattr(args, 'power_window_min_points', 8)),
+        min_window_fraction=float(getattr(args, 'power_window_min_fraction', 0.05)),
+    )
+    env_info = {
+        "beta_env": float(env_fit.get("tempered", {}).get("beta_env", float("nan"))),
+        "beta_env_r2": float(env_fit.get("tempered", {}).get("r2", float("nan"))),
+    }
 
     # --- Checkpoint-level phase classification ---
-    # At checkpoint time we do NOT have the full three-model AIC
-    # comparison (that runs only at convergence in
-    # compute_and_save_final_envelopes).  We therefore skip
-    # Table 1's step 1 (envelope model comparison) and classify
-    # based on tail-fit quality and bootstrap interval alone.
-    #
-    # If the CCDF tail fit is poor, we cannot distinguish collapsed
-    # from anti-collapsed without the envelope comparison, so the
-    # label is "unresolved (checkpoint)".  If the tail fit is good,
-    # the bootstrap interval assigns concentrated / broad / boundary.
-    # The definitive phase label including the envelope comparison
-    # is emitted only at convergence.
-    _r2_thr = float(getattr(args, 'phase_r2_threshold', 0.90))
-    _tail_ok = (np.isfinite(tail["beta_r2"])
-                and tail["beta_r2"] >= _r2_thr
-                and boot.get("B_effective", 0) >= 10)
-    if not _tail_ok:
-        phase_label = "unresolved (checkpoint)"
-    else:
-        _beta_lo = float(boot.get("beta_lo", float("nan")))
-        _beta_hi = float(boot.get("beta_hi", float("nan")))
-        if not (np.isfinite(_beta_lo) and np.isfinite(_beta_hi)):
-            phase_label = "unresolved (checkpoint)"
-        elif _beta_lo > 1.0:
-            phase_label = "concentrated anti-collapse"
-        elif _beta_hi < 1.0:
-            phase_label = "broad anti-collapse"
-        else:
-            phase_label = "boundary (soft classification)"
+    # This is still a trajectory diagnostic, not the final publication
+    # verdict, but it uses the same power-law-window gate as the final
+    # analysis so threshold-crossing is not driven by degenerate CCDF tails.
+    phase_label = classify_phase(
+        envelope_winner=str(env_fit.get("envelope_winner", "exponential")),
+        tail_r2=float(tail["beta_r2"]),
+        beta_lo=float(boot.get("beta_lo", float("nan"))),
+        beta_hi=float(boot.get("beta_hi", float("nan"))),
+        r2_threshold=float(getattr(args, 'phase_r2_threshold', 0.90)),
+        power_law_window_pass=bool(crossover_diag.get("power_law_window_pass", False)),
+    )
 
     # --- Assemble row ---
     row = {
@@ -2072,6 +2453,9 @@ def run_checkpoint_diagnostics(
         "tau_mean": float(tail["tau_mean"]),
         "tau_q90": float(tail["tau_q90"]),
         "tau_q99": float(tail["tau_q99"]),
+        "zeta_q10": zeta_q10,
+        "zeta_q90": zeta_q90,
+        "delta_zeta": delta_zeta,
         "tau_fit_r2_mean": float(tau_fit_info.get("r2_mean", float("nan"))),
         "tau_fit_n_valid": int(tau_fit_info.get("n_valid_neurons", 0)),
         "fit_lags_min": int(np.min(fit_lags)),

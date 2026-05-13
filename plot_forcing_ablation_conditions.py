@@ -7,7 +7,7 @@ different ablation conditions (batch size, gradient clipping, Winsorization) aga
 the baseline.
 
 Usage:
-    python plot_exp2_ablation.py \
+    python plot_forcing_ablation_conditions.py \
         --agg_dir <path_to_aggregated_dir> \
         --outdir <path_to_output_dir> \
         --dpi 300
@@ -21,6 +21,13 @@ from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parent / ".mplcache"))
+Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
@@ -47,10 +54,8 @@ plt.rcParams.update({
 })
 
 
-class Experiment2Plotter:
+class ForcingAblationConditionPlotter:
     """Plotter for Experiment 3 ablation study.
-
-    The class name is kept for backward compatibility with older imports.
     """
 
     def __init__(self, agg_dir: str, outdir: str, dpi: int = 300,
@@ -611,7 +616,7 @@ class Experiment2Plotter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Plot Experiment 2 (Stochastic Forcing Ablation) results')
+        description='Plot forcing-ablation condition results')
     parser.add_argument('--agg_dir', required=True,
                        help='Path to aggregated results directory')
     parser.add_argument('--outdir', required=True,
@@ -643,7 +648,7 @@ def main():
         sys.exit(1)
 
     # Create plotter and run
-    plotter = Experiment2Plotter(
+    plotter = ForcingAblationConditionPlotter(
         agg_dir=args.agg_dir,
         outdir=args.outdir,
         dpi=args.dpi,

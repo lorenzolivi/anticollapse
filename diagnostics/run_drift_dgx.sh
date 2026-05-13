@@ -4,7 +4,7 @@
 #
 # Usage (run from the diagnostics/ folder):
 #     ./run_drift_dgx.sh smoke   # short smoke test, 1 seed, small models
-#     ./run_drift_dgx.sh full    # full validation, stressed task, GRU + DiagGate
+#     ./run_drift_dgx.sh full    # full validation, stressed task, DiagGate
 #
 # Both modes:
 #   - Write all outputs under diagnostics/<outdir>/
@@ -12,12 +12,16 @@
 #   - Never copy figures into latex/figures; all artifacts stay in the outdir
 #   - Run in the background via nohup and store the PID in <outdir>.pid
 #
-# The full mode is intended to replace the previous GRU-only drift smoke test.
-# It validates the far-left-tail closure model-by-model, using:
-#   - GRU + DiagGate by default;
+# The full mode validates the far-left-tail closure for an
+# anti-collapsed architecture--optimizer pair (DiagGate by default;
+# override MODELS to add or substitute architectures). It uses:
 #   - heavier task-side lag pressure than the main experiments;
 #   - dense checkpointing for zeta-transition estimates;
 #   - multi-projection alpha estimation (K=16 by default).
+# The closure is a modeling assumption; one full-scale validation in
+# the regime where it is meant to apply is sufficient. Architecture-
+# dependence of the plateau is reported in the body of the paper as
+# part of the Experiment 2 diagnostic table.
 #
 # Environment overrides:
 #   OUTDIR, MODELS, SEEDS, DEVICE
@@ -36,7 +40,7 @@ DEVICE="${DEVICE:-auto}"
 case "$MODE" in
     smoke)
         OUTDIR="${OUTDIR:-drift_smoketest_v2}"
-        MODELS="${MODELS:-diag,gru}"
+        MODELS="${MODELS:-diag}"
         SEEDS="${SEEDS:-42}"
         H="${H:-256}"
         T="${T:-512}"
@@ -55,7 +59,7 @@ case "$MODE" in
         ;;
     full)
         OUTDIR="${OUTDIR:-drift_validation_v2}"
-        MODELS="${MODELS:-diag,gru}"
+        MODELS="${MODELS:-diag}"
         SEEDS="${SEEDS:-42,123,321,456,789}"
         H="${H:-512}"
         T="${T:-1280}"

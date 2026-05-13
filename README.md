@@ -5,9 +5,10 @@ Code accompanying the ongoing project:
 **Lorenzo Livi**  
 *Anti-Collapse Dynamics and the Emergence of Multi-Time-Scale Learning in Recurrent Neural Networks*
 
-Publication metadata such as public manuscript links, DOI, and release citation
-will be added later. The repository metadata is intentionally kept in template
-form until those details are finalized.
+Preprint: forthcoming. Public manuscript links, DOI information, and the
+preferred release citation will be added once the preprint is public. The
+repository metadata is intentionally kept in template form until those details
+are finalized.
 
 This repository contains the experimental and diagnostic code for the
 anti-collapse project. The focus is on how broad time-scale spectra emerge
@@ -36,24 +37,33 @@ The main pipeline is organized around three main-text experiments:
 The code also includes a sidecar diagnostics suite in `diagnostics/`
 for validating structural assumptions behind the theory.
 
+The paper-scale runs are intentionally resource-bounded. They use the largest
+systematic multi-seed, multi-checkpoint configuration we could run with the
+available compute while retaining the full diagnostic suite. The code is
+organized so that other groups with larger compute budgets can scale the same
+protocols to wider networks, longer horizons, more seeds, and finer ablation
+grids.
+
 ## Repository Structure
 
 ```text
 .
 ├── anticollapse.sh                 # Unified main-text experiment launcher
 ├── plot_all.sh                     # Unified plotting / analysis launcher
-├── run_exp1.py                     # Phase-trajectory runner used by Exp 1/2
-├── run_exp2.py                     # Forcing-ablation runner used by Exp 3
-├── main_exp1.py                    # Multi-seed phase-trajectory orchestration
-├── main_exp2.py                    # Multi-seed forcing-ablation orchestration
+├── run_phase_trajectory.py         # Phase-trajectory runner used by Exp 1/2
+├── run_forcing_ablation.py         # Forcing-ablation runner used by Exp 3
+├── main_phase_trajectory.py        # Multi-seed phase-trajectory orchestration
+├── main_forcing_ablation.py        # Multi-seed forcing-ablation orchestration
 ├── models.py                       # Shared gated RNN architectures
 ├── transport.py                    # Transport-factor / mu_{t,ell} computation
 ├── diagnostics.py                  # Main diagnostics pipeline
 ├── data.py                         # Synthetic delayed-regression task
 ├── alpha_utils.py                  # Stable-tail estimation utilities
 ├── seed_utils.py                   # CSV discovery, loading, aggregation helpers
-├── plot_exp1_*.py                  # Phase-trajectory plotting scripts
-├── plot_exp2_ablation.py           # Exp 3 forcing-ablation plotting script
+├── plot_exp1_*.py                  # Exp 1 plotting scripts
+├── plot_exp2_phase_ladder.py       # Exp 2 capacity-ladder plotting script
+├── plot_exp3_forcing_ablation.py   # Exp 3 forcing-ablation plotting script
+├── write_exp*_summary.py           # Markdown summaries for experiment outputs
 ├── diagnostics/
 │   ├── run_mixture.py              # Diagnostic 1: mixture-of-exponentials validation
 │   ├── run_width_scaling.py        # Diagnostic 2: population-concentration validation
@@ -64,11 +74,9 @@ for validating structural assumptions behind the theory.
 └── README.md
 ```
 
-Legacy monolithic experiment scripts (previously
-`run_anticollapse_exp1_phase_trajectory_baselines.py`,
-`run_anticollapse_exp1_phase_trajectory_lstmgru.py`,
-`run_anticollapse_exp2_forcing_ablation.py`) have been deleted.
-The modular `run_exp1.py` and `run_exp2.py` runners are the only entry points.
+The modular `run_phase_trajectory.py` and `run_forcing_ablation.py` runners
+are the single-seed execution entry points; `main_phase_trajectory.py` and
+`main_forcing_ablation.py` are the multi-seed orchestrators.
 
 ## Requirements
 
@@ -87,7 +95,7 @@ Core dependencies:
 
 `SciPy` is required for parts of the diagnostics and validation suite.
 
-## Hardware Notes
+## Hardware And Computational Scope
 
 The project is designed to run on:
 
@@ -97,6 +105,19 @@ The project is designed to run on:
 
 On a MacBook Pro, `--device auto` will usually select `mps` when available.
 If `mps` becomes unstable for a long run, rerun with `--device cpu`.
+
+The full paper-scale configuration is the largest systematic validation we
+could afford with the available computational resources while preserving dense
+checkpointing and all diagnostics. The expensive parts are not only training:
+per-checkpoint tail-index estimation, tau-spectrum extraction, envelope
+fitting, bootstrap summaries, and drift diagnostics all scale with the number
+of seeds, checkpoints, neurons, and intervention conditions.
+
+Researchers with larger compute budgets can scale the same scripts by
+increasing, for example, `H`, `epochs`, `Nseq_train`, `Nseq_diag`, the number of
+seeds, the number of checkpoints, and the granularity of Exp 3 ablation grids.
+Smoke profiles are intended only for pipeline validation; they should not be
+read as evidence for the paper's empirical claims.
 
 ## Running The Main Experiments
 
@@ -146,8 +167,8 @@ simulations via:
 ```
 
 The root orchestration scripts remain available for direct use:
-`main_exp1.py` is the phase-trajectory engine used by main-text
-Experiments 1 and 2, while `main_exp2.py` is the forcing-ablation
+`main_phase_trajectory.py` is the phase-trajectory engine used by main-text
+Experiments 1 and 2, while `main_forcing_ablation.py` is the forcing-ablation
 engine used by main-text Experiment 3.
 
 ### Experiment 1: structural negative control
@@ -155,7 +176,7 @@ engine used by main-text Experiment 3.
 ConstGate + AdamW on the heavy-tailed-lag task:
 
 ```bash
-python main_exp1.py \
+python main_phase_trajectory.py \
   --outdir results/exp1_constgate_full \
   --seeds 42,123,321,456,789 \
   --models const \
@@ -176,7 +197,7 @@ python main_exp1.py \
 Capacity ladder on the same task:
 
 ```bash
-python main_exp1.py \
+python main_phase_trajectory.py \
   --outdir results/exp2_phase_full \
   --seeds 42,123,321,456,789 \
   --models shared,diag,gru,lstm \
@@ -197,7 +218,7 @@ python main_exp1.py \
 Warm-start causal ablation:
 
 ```bash
-python main_exp2.py \
+python main_forcing_ablation.py \
   --outdir results/exp3_forcing_full \
   --seeds 42,123,321,456,789 \
   --models diag \

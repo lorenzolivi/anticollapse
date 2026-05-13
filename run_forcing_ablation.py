@@ -27,15 +27,15 @@ Uses shared modules: models, transport, diagnostics, data.
 
 Usage:
   # From-scratch baseline
-  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
+  python run_forcing_ablation.py --outdir results/exp3_forcing/seed_0042 \\
     --condition baseline --seed 42
 
   # Batch ablation from scratch
-  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
+  python run_forcing_ablation.py --outdir results/exp3_forcing/seed_0042 \\
     --condition batch_ablation --ablation_values 2048,4096,8192
 
   # Warm-start winsorization (train normally for 250 epochs, then intervene)
-  python run_exp2.py --outdir results/exp3_forcing/seed_0042 \\
+  python run_forcing_ablation.py --outdir results/exp3_forcing/seed_0042 \\
     --condition winsorize_ablation --ablation_values 95,90,80 \\
     --warmup_epochs 250
 """
@@ -108,6 +108,7 @@ TRAJ_COLS = [
     "beta_hat", "beta_r2",
     "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "beta_bootstrap_B_eff",
     "tau_mean", "tau_q90", "tau_q99",
+    "zeta_q10", "zeta_q90", "delta_zeta",
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
@@ -119,6 +120,48 @@ TRAJ_COLS = [
 # ============================================================
 # Training loop with phase tracking + ablation
 # ============================================================
+
+def build_optimizer_for_model(args, model: BaseRNN):
+    """Construct the optimizer used by the experiment."""
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(
+            model.parameters(), lr=args.lr, momentum=0.0,
+            weight_decay=args.weight_decay,
+        )
+    if args.optimizer == "sgd_momentum":
+        return torch.optim.SGD(
+            model.parameters(), lr=args.lr, momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    raise ValueError(f"Unknown optimizer {args.optimizer}")
+
+
+def save_analysis_checkpoint(
+    args,
+    model: BaseRNN,
+    optimizer: torch.optim.Optimizer,
+    model_name: str,
+    mdir: str,
+    epoch: int,
+    step: int,
+) -> None:
+    """Save final state needed by the later plotting/analysis pass."""
+    ckpt_dir = os.path.join(mdir, "analysis_checkpoint")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, "final.pt")
+    torch.save({
+        "model_name": model_name,
+        "epoch": int(epoch),
+        "step": int(step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+    }, ckpt_path)
+    log(f"[ckpt:{model_name}] saved final analysis checkpoint -> {ckpt_path}")
 
 def train_with_phase_tracking_ablation(
     args,
@@ -147,23 +190,7 @@ def train_with_phase_tracking_ablation(
       - All epochs use ablated hyperparameters (from-scratch ablation)
     """
 
-    # Optimizer
-    if args.optimizer == "adamw":
-        opt = torch.optim.AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-        )
-    elif args.optimizer == "sgd":
-        opt = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=0.0,
-            weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "sgd_momentum":
-        opt = torch.optim.SGD(
-            model.parameters(), lr=args.lr, momentum=args.momentum,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        raise ValueError(f"Unknown optimizer {args.optimizer}")
+    opt = build_optimizer_for_model(args, model)
 
     if args.orth_init:
         model.apply_orthogonal()
@@ -289,7 +316,7 @@ def train_with_phase_tracking_ablation(
             row = run_checkpoint_diagnostics(
                 args, model, model_name, mdir, ep,
                 Xtr_cpu, Ytr_cpu, Xdg_cpu,
-                device=device, fit_lags=fit_lags,
+                device=device, fit_lags=fit_lags, ells=ells,
                 step=global_step,
                 alpha_batch_size_override=current_bs,
                 alpha_grad_clip_override=current_clip,
@@ -306,29 +333,10 @@ def train_with_phase_tracking_ablation(
                 torch.save(model.state_dict(), ckpt_path)
                 log(f"[ckpt:{model_name}] saved warmup checkpoint at epoch={ep}")
 
-    if args.save_final_envelope and not nan_halt:
-        # Final GELR envelope diagnostics need the live optimizer state.
-        # Also runs definitive phase classification (Table 1 with AIC).
-        # NOTE: the canonical final_phase.json is only emitted when
-        # --save_final_envelope is set.  Paper runs should always use
-        # this flag; otherwise only checkpoint-level (provisional)
-        # phase labels are available.
-        log(f"[final:{model_name}] computing transport and GELR envelopes ...")
-        compute_and_save_final_envelopes(
-            model_name=model_name,
-            model=model,
-            optimizer=opt,
-            mdir=mdir,
-            Xdg_cpu=Xdg_cpu,
-            device=device,
-            ells=ells,
-            diag_batch_size=int(args.diag_batch_size),
-            fit_lags=fit_lags,
-            tau_ccdf_qmin=float(args.tau_ccdf_qmin),
-            tau_ccdf_qmax=float(args.tau_ccdf_qmax),
-            beta_bootstrap_B=int(args.beta_bootstrap_B),
-            beta_bootstrap_ci=float(args.beta_bootstrap_ci),
-            phase_r2_threshold=float(args.phase_r2_threshold),
+    if args.save_analysis_checkpoint and not nan_halt:
+        save_analysis_checkpoint(
+            args, model, opt, model_name, mdir,
+            epoch=int(args.epochs), step=global_step,
         )
 
     # Threshold-crossing detection
@@ -386,7 +394,7 @@ def run_for_condition(
     """Run all models for a single (condition, condition_value) pair.
 
     Directory layout: outdir/<model>/<condition_dir>/...
-    This matches the convention expected by main_exp2.py aggregation.
+    This matches the convention expected by main_forcing_ablation.py aggregation.
     """
 
     cond_tag = _condition_dir_name(condition, condition_value)
@@ -438,6 +446,59 @@ def run_for_condition(
             ablation_grad_clip=abl_grad_clip,
             winsorize_pct=winsorize_pct,
             warmup_epochs=warmup,
+        )
+
+
+def analyze_final_envelope_for_condition(
+    args,
+    condition: str,
+    condition_value,
+    outdir: str,
+    Xdg_cpu: torch.Tensor,
+    device: torch.device,
+    fit_lags: np.ndarray,
+    ells: np.ndarray,
+) -> None:
+    """Load saved final states for a condition and compute final analysis."""
+    cond_tag = _condition_dir_name(condition, condition_value)
+    models = [m.strip().lower() for m in args.models.split(",") if m.strip()]
+
+    for mname in models:
+        mdir = os.path.join(outdir, mname, cond_tag)
+        ckpt_path = os.path.join(mdir, "analysis_checkpoint", "final.pt")
+        if not os.path.isfile(ckpt_path):
+            log(f"[analysis:{mname}/{cond_tag}] missing checkpoint: {ckpt_path}")
+            continue
+
+        model = build_model(
+            mname, args.D, args.H,
+            const_s=args.const_s, ln=args.layernorm,
+        ).to(device)
+        opt = build_optimizer_for_model(args, model)
+
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        opt.load_state_dict(ckpt["optimizer_state_dict"])
+
+        log(f"[analysis:{mname}/{cond_tag}] computing final envelopes")
+        compute_and_save_final_envelopes(
+            model_name=mname,
+            model=model,
+            optimizer=opt,
+            mdir=mdir,
+            Xdg_cpu=Xdg_cpu,
+            device=device,
+            ells=ells,
+            diag_batch_size=int(args.diag_batch_size),
+            fit_lags=fit_lags,
+            tau_ccdf_qmin=float(args.tau_ccdf_qmin),
+            tau_ccdf_qmax=float(args.tau_ccdf_qmax),
+            beta_bootstrap_B=int(args.beta_bootstrap_B),
+            beta_bootstrap_ci=float(args.beta_bootstrap_ci),
+            phase_r2_threshold=float(args.phase_r2_threshold),
+            power_window_beta_min=float(args.power_window_beta_min),
+            power_window_min_points=int(args.power_window_min_points),
+            power_window_min_fraction=float(args.power_window_min_fraction),
         )
 
 
@@ -532,10 +593,21 @@ def parse_args():
     # Phase classification
     p.add_argument("--phase_r2_threshold", type=float, default=0.90,
                    help="R² threshold for CCDF tail fit to be considered reliable")
+    p.add_argument("--power_window_beta_min", type=float, default=0.10,
+                   help="Minimum envelope exponent for a visible power-law window")
+    p.add_argument("--power_window_min_points", type=int, default=8,
+                   help="Minimum lag-grid points in the power-law window")
+    p.add_argument("--power_window_min_fraction", type=float, default=0.05,
+                   help="Minimum fraction of lag-grid points in the power-law window")
 
-    # Saving
+    # Saving / later analysis
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
-    p.add_argument("--save_final_envelope", action="store_true")
+    p.add_argument("--save_final_envelope", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--save_analysis_checkpoint", action="store_true",
+                   help="Save final model+optimizer state for later plot/analysis pass")
+    p.add_argument("--analysis_only", action="store_true",
+                   help="Skip training and compute final envelope analysis from saved checkpoint")
 
     # Ablation condition
     p.add_argument("--condition", type=str, default="baseline",
@@ -616,11 +688,13 @@ def main():
         Ytr_cpu = Ytr_cpu.pin_memory()
         Xdg_cpu = Xdg_cpu.pin_memory()
 
-    # Save metadata
-    with open(os.path.join(args.outdir, "cli_args.json"), "w") as jf:
-        json.dump(vars(args), jf, indent=2)
-    with open(os.path.join(args.outdir, "lag_grid.json"), "w") as jf:
-        json.dump({"ells": ells.tolist(), "tau_fit_lags": fit_lags.tolist()}, jf, indent=2)
+    # Save metadata for simulation runs.  Analysis-only passes should not
+    # rewrite the original data-collection manifest.
+    if not args.analysis_only:
+        with open(os.path.join(args.outdir, "cli_args.json"), "w") as jf:
+            json.dump(vars(args), jf, indent=2)
+        with open(os.path.join(args.outdir, "lag_grid.json"), "w") as jf:
+            json.dump({"ells": ells.tolist(), "tau_fit_lags": fit_lags.tolist()}, jf, indent=2)
 
     # Determine conditions to run
     if args.condition == "baseline":
@@ -647,12 +721,20 @@ def main():
         raise ValueError(f"Unknown condition {args.condition}")
 
     for cond, cond_val in conditions_to_run:
-        log(f"[run] condition={cond} value={cond_val}")
-        run_for_condition(
-            args, cond, cond_val, args.outdir,
-            Xtr_cpu, Ytr_cpu, Xdg_cpu,
-            device=device, fit_lags=fit_lags, ells=ells,
-        )
+        if args.analysis_only:
+            log(f"[analysis] condition={cond} value={cond_val}")
+            analyze_final_envelope_for_condition(
+                args, cond, cond_val, args.outdir,
+                Xdg_cpu,
+                device=device, fit_lags=fit_lags, ells=ells,
+            )
+        else:
+            log(f"[run] condition={cond} value={cond_val}")
+            run_for_condition(
+                args, cond, cond_val, args.outdir,
+                Xtr_cpu, Ytr_cpu, Xdg_cpu,
+                device=device, fit_lags=fit_lags, ells=ells,
+            )
 
     log("Done.")
 

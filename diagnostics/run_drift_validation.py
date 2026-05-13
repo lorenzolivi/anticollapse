@@ -15,7 +15,7 @@ directory. It never copies figures into the manuscript/Overleaf tree.
 
 Steps:
     1. Train the selected architecture on the heavy-tailed-lag task variant
-       using ../main_exp1.py, with dense checkpointing so that the
+       using ../main_phase_trajectory.py, with dense checkpointing so that the
        late-training tau spectrum is well sampled.
     2. Run ``run_restoring_drift.py`` on the resulting run directory with
        the far-tail saturation diagnostic enabled.
@@ -40,7 +40,7 @@ from datetime import datetime
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))                # diagnostics/
 PROJECT_ROOT = os.path.dirname(THIS_DIR)                             # repo root
-MAIN_EXP1 = os.path.join(PROJECT_ROOT, "main_exp1.py")
+MAIN_PHASE_TRAJECTORY = os.path.join(PROJECT_ROOT, "main_phase_trajectory.py")
 RESTORING_DRIFT = os.path.join(THIS_DIR, "run_restoring_drift.py")
 
 CKPT_ALPHA_RE = re.compile(r"^ckpt_(\d+)_alpha_grad\.json$")
@@ -108,7 +108,7 @@ def summarize_alpha_projections(
     1. The pooled (global) tail index ``alpha_hat`` (configured estimator,
        usually pooled ECF) together with the bootstrap CI for the pooled
        McCulloch estimate ``alpha_mcc_boot_ci_pooled`` saved by
-       ``main_exp1.py``. The pooled estimate answers whether the entire
+       ``main_phase_trajectory.py``. The pooled estimate answers whether the entire
        projected-gradient cloud is globally heavy-tailed.
     2. The directional median and IQR of the per-projection McCulloch
        estimates ``alpha_hat_per_dir_mcc``. The directional distribution
@@ -260,7 +260,7 @@ def summarize_alpha_projections(
             "(i) Pooled ECF (primary global estimate): alpha_hat / "
             "alpha_ecf. The pooled ECF estimator does not currently "
             "propagate a bootstrap CI. The field alpha_hat_se is NOT a "
-            "pooled-ECF standard error: in main_exp1.py it is computed "
+            "pooled-ECF standard error: in main_phase_trajectory.py it is computed "
             "as alpha_mcc_std / sqrt(K), i.e.\\ a cross-direction "
             "McCulloch dispersion proxy, and is retained here only for "
             "audit / cross-checking, not as ECF uncertainty. "
@@ -284,7 +284,7 @@ def summarize_alpha_projections(
             "final_alpha_per_dir_frac_below_1p6_median). The "
             "per-projection minimum is a sensitivity flag only. "
             "Optional: alpha_mcculloch is a bootstrap-weighted "
-            "directional median computed by main_exp1.py and is "
+            "directional median computed by main_phase_trajectory.py and is "
             "DIFFERENT from the simple per-direction median; if used in "
             "tables, label it explicitly as the weighted directional "
             "McCulloch. "
@@ -332,7 +332,7 @@ def summarize_alpha_projections(
             for thr in TAILINESS_SWEEP
         },
         # Optional layer: bootstrap-weighted directional McCulloch
-        # (alpha_mcculloch in main_exp1.py). This is DIFFERENT from
+        # (alpha_mcculloch in main_phase_trajectory.py). This is DIFFERENT from
         # alpha_per_dir_median above; report only if explicitly labeled
         # as the weighted directional median.
         "final_alpha_mcculloch_median_weighted": _quantile(final_alpha_mcc_weighted, 0.50),
@@ -391,7 +391,7 @@ def parse_args():
     # Checkpoint diagnostics.  The drift diagnostic itself uses the saved
     # tau spectra, but the training run also records the alpha forcing proxy.
     # Exposing these knobs lets the DGX launcher use the multi-projection
-    # protocol described in learnability.tex without changing main_exp1.py.
+    # protocol described in learnability.tex without changing main_phase_trajectory.py.
     p.add_argument("--alpha_n_directions", type=int, default=5,
                    help="Number of independent projection directions for alpha estimation.")
     p.add_argument("--alpha_n_grad_batches_ckpt", type=int, default=256,
@@ -400,7 +400,7 @@ def parse_args():
                    help="Batch size used when collecting gradient projections.")
     p.add_argument("--alpha_method", type=str, default="ecf",
                    choices=["ecf", "mcculloch"],
-                   help="Primary alpha-estimation method used by main_exp1.py.")
+                   help="Primary alpha-estimation method used by main_phase_trajectory.py.")
     p.add_argument("--min_samples_alpha", type=int, default=500)
 
     # Tau-spectrum fit range used to construct zeta(t) = -log tau(t).
@@ -456,10 +456,10 @@ def main():
     # Step 1: training (selected seeds, heavy-tailed-lag, dense checkpoints)
     # ------------------------------------------------------------------
     if not args.skip_train:
-        if not os.path.exists(MAIN_EXP1):
-            raise FileNotFoundError(f"Could not find main_exp1.py at {MAIN_EXP1}")
+        if not os.path.exists(MAIN_PHASE_TRAJECTORY):
+            raise FileNotFoundError(f"Could not find main_phase_trajectory.py at {MAIN_PHASE_TRAJECTORY}")
         train_cmd = [
-            sys.executable, MAIN_EXP1,
+            sys.executable, MAIN_PHASE_TRAJECTORY,
             "--outdir", train_dir,
             "--seeds", args.seeds,
             "--models", args.model,
@@ -505,7 +505,7 @@ def main():
     # ------------------------------------------------------------------
     # Step 2: drift diagnostic with far-tail saturation
     # ------------------------------------------------------------------
-    # main_exp1.py puts seed directories under <train_dir>/<optimizer>/seed_*/.
+    # main_phase_trajectory.py puts seed directories under <train_dir>/<optimizer>/seed_*/.
     input_dir = os.path.join(train_dir, args.optimizer)
     if not args.skip_diagnostic:
         if not os.path.exists(RESTORING_DRIFT):

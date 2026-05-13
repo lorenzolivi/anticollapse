@@ -9,10 +9,14 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.mplcache/
 
 # Generated experiment outputs
 results/
 results_smoke*/
+
+# Local exploratory notebooks/scripts not part of the replication pipeline
+visualize_mixed_sde_jax.py
 
 # Generated diagnostics outputs (keep diagnostics code tracked)
 diagnostics/results*/

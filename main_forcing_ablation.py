@@ -6,7 +6,7 @@ Anti-Collapse — Experiment 3 orchestration script
 =================================================
 
 Runs the full Stochastic Forcing Ablation experiment pipeline for multiple seeds:
-  1) For each seed: for each condition, run the unified run_exp2.py
+  1) For each seed: for each condition, run the unified run_forcing_ablation.py
   2) After all seeds: aggregate phase trajectories across seeds (mean ± stderr)
   3) Run the plotting pipeline on the aggregated results
 
@@ -15,12 +15,12 @@ the intervention. Pass --warmup_epochs 0 (default) for from-scratch ablation.
 
 Usage:
   # From-scratch ablation (default)
-  python main_exp2.py --outdir results/exp3_forcing --seeds 42,123,321
+  python main_forcing_ablation.py --outdir results/exp3_forcing --seeds 42,123,321
 
   # Warm-start ablation (250 epochs normal, then intervene)
-  python main_exp2.py --outdir results/exp3_forcing --seeds 42,123,321 --warmup_epochs 250
+  python main_forcing_ablation.py --outdir results/exp3_forcing --seeds 42,123,321 --warmup_epochs 250
 
-This script calls run_exp2.py as a subprocess.
+This script calls run_forcing_ablation.py as a subprocess.
 
 Directory layout produced:
   <outdir>/<optimizer>/
@@ -336,6 +336,7 @@ def aggregate_final_artifacts_for_condition(seed_dirs: List[str], model_name: st
 
     csv_specs = [
         ("_envelope.csv", ["ell"]),
+        ("_envelope_audit.csv", ["ell"]),
         ("_envelope_fit_curves.csv", ["ell"]),
         ("_adaptive_base_rates.csv", ["neuron_q"]),
         ("_gelr_envelope_compare.csv", ["ell"]),
@@ -466,12 +467,12 @@ def save_aggregated_learning_curve(agg: Dict, outpath: str):
 # ============================================================
 
 def run_plotting_multiseed(agg_dir: str, outdir: str, dpi: int, extra_plot_args: Dict):
-    """Run plot_exp2_ablation.py on the aggregated results."""
+    """Run plot_forcing_ablation_conditions.py on the aggregated results."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plot_script = os.path.join(script_dir, "plot_exp2_ablation.py")
+    plot_script = os.path.join(script_dir, "plot_forcing_ablation_conditions.py")
 
     if not os.path.exists(plot_script):
-        log(f"[WARN] Exp2 plot driver not found: {plot_script}")
+        log(f"[WARN] forcing-ablation plot driver not found: {plot_script}")
         return False
 
     cmd = [sys.executable, plot_script, "--agg_dir", agg_dir, "--outdir", outdir, "--dpi", str(dpi)]
@@ -535,7 +536,7 @@ def build_condition_ablation_grid(args) -> List[Tuple[str, str]]:
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Anti-Collapse Exp2: multi-seed orchestration (forcing ablation)")
+    p = argparse.ArgumentParser(description="Anti-Collapse: multi-seed forcing-ablation orchestration")
 
     # output
     p.add_argument("--outdir", type=str, required=True,
@@ -629,10 +630,19 @@ def parse_args():
                    help="Confidence level for bootstrap stability interval (default: 0.90)")
     p.add_argument("--phase_r2_threshold", type=float, default=0.90,
                    help="Tail-fit R^2 threshold for phase classification (default: 0.90)")
+    p.add_argument("--power_window_beta_min", type=float, default=0.10,
+                   help="Minimum envelope exponent for a visible power-law window (default: 0.10)")
+    p.add_argument("--power_window_min_points", type=int, default=8,
+                   help="Minimum lag-grid points in the power-law window (default: 8)")
+    p.add_argument("--power_window_min_fraction", type=float, default=0.05,
+                   help="Minimum fraction of lag-grid points in the power-law window (default: 0.05)")
 
-    # envelope + ccdf saves
+    # experiment data / deferred analysis saves
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
-    p.add_argument("--save_final_envelope", action="store_true")
+    p.add_argument("--save_final_envelope", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--save_analysis_checkpoint", action="store_true",
+                   help="Save final model+optimizer state for plot_only analysis")
 
     # lag grid (for envelopes)
     p.add_argument("--lag_min", type=int, default=4)
@@ -698,6 +708,9 @@ def build_common_args(args) -> Dict:
         "beta_bootstrap_B": args.beta_bootstrap_B,
         "beta_bootstrap_ci": args.beta_bootstrap_ci,
         "phase_r2_threshold": args.phase_r2_threshold,
+        "power_window_beta_min": args.power_window_beta_min,
+        "power_window_min_points": args.power_window_min_points,
+        "power_window_min_fraction": args.power_window_min_fraction,
         "device": args.device,
         # warm-start
         "warmup_epochs": args.warmup_epochs,
@@ -707,12 +720,39 @@ def build_common_args(args) -> Dict:
         "alpha_use_grad_clip": args.alpha_use_grad_clip,
         "save_checkpoint_ccdf": args.save_checkpoint_ccdf,
         "save_final_envelope": args.save_final_envelope,
+        "save_analysis_checkpoint": args.save_analysis_checkpoint,
     }
     return d
 
 
+def _load_run_config_for_plot_only(args):
+    """Use the saved run config so analysis uses the exact simulation setup."""
+    opt_dir = os.path.join(args.outdir, args.optimizer)
+    cfg_candidates = [
+        os.path.join(opt_dir, "forcing_ablation_config.json"),
+        # Backward compatibility for result folders produced before the
+        # role-based script rename.
+        os.path.join(opt_dir, "main_exp2_config.json"),
+    ]
+    cfg_path = next((p for p in cfg_candidates if os.path.isfile(p)), cfg_candidates[0])
+    if not args.plot_only or not os.path.isfile(cfg_path):
+        return args
+    with open(cfg_path) as jf:
+        cfg = json.load(jf)
+    preserve = {
+        "outdir", "plot_only", "skip_plot", "dpi", "tau_cap",
+        "min_r2", "min_beta_r2",
+    }
+    for key, value in cfg.items():
+        if key not in preserve and hasattr(args, key):
+            setattr(args, key, value)
+    log(f"[plot_only] loaded run configuration from {cfg_path}")
+    return args
+
+
 def main():
     args = parse_args()
+    args = _load_run_config_for_plot_only(args)
 
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     if not seeds:
@@ -729,8 +769,10 @@ def main():
     else:
         log(f"Mode: FROM-SCRATCH ablation")
 
-    # Save orchestration config
-    with open(os.path.join(opt_dir, "main_exp2_config.json"), "w") as jf:
+    # Save orchestration config.  Preserve the simulation manifest during
+    # plot_only analysis; write analysis settings separately.
+    config_name = "forcing_ablation_analysis_config.json" if args.plot_only else "forcing_ablation_config.json"
+    with open(os.path.join(opt_dir, config_name), "w") as jf:
         json.dump(vars(args), jf, indent=2)
 
     # Build experiment grid
@@ -741,7 +783,7 @@ def main():
     log(f"Models: {models}")
 
     # Group grid by condition name for efficient subprocess calls
-    # run_exp2.py handles multiple ablation_values per condition in one call
+    # run_forcing_ablation.py handles multiple ablation_values per condition in one call
     cond_groups: Dict[str, List[str]] = {}
     for cond_name, cond_value in cond_ablation_grid:
         if cond_name not in cond_groups:
@@ -765,7 +807,7 @@ def main():
         w_seed = args.w_seed_base + seed
 
         if not args.plot_only:
-            # For each condition group, call run_exp2.py once
+            # For each condition group, call run_forcing_ablation.py once
             for cond_name, cond_values in cond_groups.items():
                 runner_outdir = seed_dir
                 runner_log = os.path.join(logs_dir, f"{seed_tag}_{cond_name}.log")
@@ -784,7 +826,7 @@ def main():
                     f"values=[{','.join(cond_values) if cond_values else 'N/A'}] "
                     f"warmup={args.warmup_epochs} -> {runner_outdir}")
                 ok = run_simulation(
-                    "run_exp2.py",
+                    "run_forcing_ablation.py",
                     runner_outdir, common_args, runner_extra,
                     seed=seed, w_seed=w_seed, log_file=runner_log
                 )
@@ -792,6 +834,33 @@ def main():
                     log(f"[seed={seed}] {cond_name} OK")
                 else:
                     log(f"[seed={seed}] {cond_name} FAILED — see {runner_log}")
+
+    if args.plot_only:
+        log("Running deferred final-envelope analysis from saved checkpoints ...")
+        for seed in seeds:
+            seed_tag = f"seed_{seed:04d}"
+            seed_dir = os.path.join(opt_dir, seed_tag)
+            w_seed = args.w_seed_base + seed
+            for cond_name, cond_values in cond_groups.items():
+                analysis_log = os.path.join(logs_dir, f"{seed_tag}_{cond_name}_analysis.log")
+                runner_extra = {
+                    "models": ",".join(models),
+                    "condition": cond_name,
+                    "const_s": args.const_s,
+                    "analysis_only": True,
+                }
+                if cond_values:
+                    runner_extra["ablation_values"] = ",".join(cond_values)
+
+                ok = run_simulation(
+                    "run_forcing_ablation.py",
+                    seed_dir, common_args, runner_extra,
+                    seed=seed, w_seed=w_seed, log_file=analysis_log,
+                )
+                if ok:
+                    log(f"[seed={seed}] {cond_name} analysis OK")
+                else:
+                    log(f"[seed={seed}] {cond_name} analysis FAILED — see {analysis_log}")
 
     # ================================================================
     # STEP 2: Aggregate phase trajectories
@@ -846,7 +915,8 @@ def main():
     # STEP 2c: Copy raw checkpoint artifacts + aggregate final-only outputs
     # ================================================================
     # Raw checkpoint directories are copied from one exemplar seed for audit plots.
-    # Final envelope / phase artifacts are aggregated across seeds below.
+    # Final envelope / phase artifacts are present only after the deferred
+    # plot_only analysis pass; when present, aggregate them across seeds below.
     log("Copying exemplar checkpoint data and aggregating final artifacts ...")
     last_seed_dir = seed_dirs[-1] if seed_dirs else None
     if last_seed_dir:
@@ -896,7 +966,8 @@ def main():
                     "p_beta_lt1_mean", "p_beta_lt1_se",
                     "beta_env_mean", "beta_env_se",
                     "alpha_hat_mean", "alpha_hat_se",
-                    "tau_mean_mean", "tau_mean_se"]
+                    "tau_mean_mean", "tau_mean_se",
+                    "delta_zeta_mean", "delta_zeta_se"]
     summary_rows = []
     for model_name in models:
         for cond_name, cond_value in cond_ablation_grid:
@@ -907,7 +978,7 @@ def main():
             n_s = agg.get("n_seeds", 0)
             cond_label = f"{cond_name}_{cond_value}"
             row = [model_name, cond_label, args.warmup_epochs, n_s]
-            for col in ["beta_hat", "beta_median", "p_beta_lt1", "beta_env", "alpha_hat", "tau_mean"]:
+            for col in ["beta_hat", "beta_median", "p_beta_lt1", "beta_env", "alpha_hat", "tau_mean", "delta_zeta"]:
                 m_key = f"{col}_mean"
                 se_key = f"{col}_se"
                 if m_key in agg and len(agg[m_key]) > 0:
@@ -923,8 +994,8 @@ def main():
     log(f"  Summary table saved to {summary_path}")
 
     # Print summary to stdout
-    log(f"  {'Model':<12} {'Condition':<30} {'warmup':>6} {'n':>4}  {'beta_hat':>8}  {'b_med':>8}  {'P(b<1)':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}")
-    log(f"  {'-'*12} {'-'*30} {'-'*6} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}")
+    log(f"  {'Model':<12} {'Condition':<30} {'warmup':>6} {'n':>4}  {'beta_hat':>8}  {'b_med':>8}  {'P(b<1)':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}  {'Dzeta':>8}")
+    log(f"  {'-'*12} {'-'*30} {'-'*6} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*8}")
     for r in summary_rows:
         model_name, cond_label, wu, n_s = r[0], r[1], r[2], r[3]
         bh_m, bh_se = r[4], r[5]
@@ -933,7 +1004,8 @@ def main():
         be_m, be_se = r[10], r[11]
         ah_m, ah_se = r[12], r[13]
         tm_m, tm_se = r[14], r[15]
-        log(f"  {model_name:<12} {cond_label:<30} {wu:>6} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {bmed_m:>5.2f}+/-{bmed_se:.2f}  {pbl_m:>5.2f}+/-{pbl_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}")
+        dz_m, dz_se = r[16], r[17]
+        log(f"  {model_name:<12} {cond_label:<30} {wu:>6} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {bmed_m:>5.2f}+/-{bmed_se:.2f}  {pbl_m:>5.2f}+/-{pbl_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}  {dz_m:>5.2f}+/-{dz_se:.2f}")
 
     # ================================================================
     # STEP 2e: Threshold localization in intervention space

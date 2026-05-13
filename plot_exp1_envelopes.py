@@ -130,6 +130,12 @@ def infer_model_key(root: str, path_or_dir: str):
         return base
     if base in ALIASES:
         return ALIASES[base]
+    for key in CANON:
+        if base.startswith(f"{key}_"):
+            return key
+    for alias, key in ALIASES.items():
+        if base.startswith(f"{alias}_"):
+            return key
     return None
 
 def list_all_envelope_csvs(root: str):

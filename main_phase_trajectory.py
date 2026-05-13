@@ -6,7 +6,7 @@ Anti-Collapse — phase-trajectory orchestration engine
 =====================================================
 
 Runs the per-model phase-trajectory pipeline for multiple seeds:
-  1) For each seed: run the unified run_exp1.py for all models
+  1) For each seed: run the unified run_phase_trajectory.py for all models
   2) After all seeds: aggregate phase trajectories across seeds (mean ± stderr)
   3) Run the plotting pipeline on the aggregated results
 
@@ -15,9 +15,9 @@ In the current manuscript this engine is used by Experiment 1
 (capacity ladder / dynamical phase trajectory; models selected by launcher).
 
 Usage:
-  python main_exp1.py --outdir results/exp2_phase --seeds 42,123,321
+  python main_phase_trajectory.py --outdir results/exp2_phase --seeds 42,123,321
 
-This script calls run_exp1.py as a subprocess.
+This script calls run_phase_trajectory.py as a subprocess.
 
 Directory layout produced:
   <outdir>/<optimizer>/
@@ -196,6 +196,7 @@ def aggregate_final_artifacts(seed_dirs: List[str], model_name: str, outdir: str
 
     csv_specs = [
         ("_envelope.csv", ["ell"]),
+        ("_envelope_audit.csv", ["ell"]),
         ("_envelope_fit_curves.csv", ["ell"]),
         ("_adaptive_base_rates.csv", ["neuron_q"]),
         ("_gelr_envelope_compare.csv", ["ell"]),
@@ -325,7 +326,7 @@ def run_plotting_single(indir: str, outdir: str, dpi: int, extra_plot_args: Dict
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Anti-Collapse Exp1: multi-seed orchestration")
+    p = argparse.ArgumentParser(description="Anti-Collapse: multi-seed phase-trajectory orchestration")
 
     # output
     p.add_argument("--outdir", type=str, required=True,
@@ -339,7 +340,7 @@ def parse_args():
 
     # model selection (unified — no more baselines/lstmgru split)
     p.add_argument("--models", type=str, default="const,shared,diag,gru,lstm",
-                   help="Comma-separated model names (all handled by unified run_exp1.py)")
+                   help="Comma-separated model names (all handled by unified run_phase_trajectory.py)")
 
     # shared simulation params
     p.add_argument("--Nseq_train", type=int, default=8000)
@@ -355,6 +356,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
+
+    # Heavy-tailed gradient-noise injection (Path A: enforced C1).
+    p.add_argument("--inject_alpha_noise", type=float, default=0.0,
+                   help="Multiplier on per-parameter (||grad||/sqrt(numel)) for "
+                        "heavy-tailed gradient-noise injection. 0 disables (default).")
+    p.add_argument("--inject_alpha", type=float, default=1.6,
+                   help="Stability index α∈(0,2] of the injected α-stable noise.")
+    p.add_argument("--inject_grad_seed_offset", type=int, default=1729,
+                   help="Offset added to --seed for the injection RNG (reproducibility).")
 
     p.add_argument("--const_s", type=float, default=0.005)
     p.add_argument("--orth_init", action="store_true")
@@ -403,10 +413,19 @@ def parse_args():
                    help="Confidence level for bootstrap stability interval (default: 0.90)")
     p.add_argument("--phase_r2_threshold", type=float, default=0.90,
                    help="Tail-fit R^2 threshold for phase classification (default: 0.90)")
+    p.add_argument("--power_window_beta_min", type=float, default=0.10,
+                   help="Minimum envelope exponent for a visible power-law window (default: 0.10)")
+    p.add_argument("--power_window_min_points", type=int, default=8,
+                   help="Minimum lag-grid points in the power-law window (default: 8)")
+    p.add_argument("--power_window_min_fraction", type=float, default=0.05,
+                   help="Minimum fraction of lag-grid points in the power-law window (default: 0.05)")
 
-    # envelope + ccdf saves
+    # experiment data / deferred analysis saves
     p.add_argument("--save_checkpoint_ccdf", action="store_true")
-    p.add_argument("--save_final_envelope", action="store_true")
+    p.add_argument("--save_final_envelope", action="store_true",
+                   help=argparse.SUPPRESS)
+    p.add_argument("--save_analysis_checkpoint", action="store_true",
+                   help="Save final model+optimizer state for plot_only analysis")
     p.add_argument("--save_model_checkpoints", action="store_true")
 
     # lag grid (for envelopes)
@@ -444,6 +463,9 @@ def build_common_args(args) -> Dict:
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
+        "inject_alpha_noise": args.inject_alpha_noise,
+        "inject_alpha": args.inject_alpha,
+        "inject_grad_seed_offset": args.inject_grad_seed_offset,
         "task_lags": args.task_lags,
         "task_coeffs": args.task_coeffs,
         "noise_std": args.noise_std,
@@ -473,6 +495,9 @@ def build_common_args(args) -> Dict:
         "beta_bootstrap_B": args.beta_bootstrap_B,
         "beta_bootstrap_ci": args.beta_bootstrap_ci,
         "phase_r2_threshold": args.phase_r2_threshold,
+        "power_window_beta_min": args.power_window_beta_min,
+        "power_window_min_points": args.power_window_min_points,
+        "power_window_min_fraction": args.power_window_min_fraction,
         "device": args.device,
         # boolean flags
         "orth_init": args.orth_init,
@@ -480,13 +505,40 @@ def build_common_args(args) -> Dict:
         "alpha_use_grad_clip": args.alpha_use_grad_clip,
         "save_checkpoint_ccdf": args.save_checkpoint_ccdf,
         "save_final_envelope": args.save_final_envelope,
+        "save_analysis_checkpoint": args.save_analysis_checkpoint,
         "save_model_checkpoints": args.save_model_checkpoints,
     }
     return d
 
 
+def _load_run_config_for_plot_only(args):
+    """Use the saved run config so analysis uses the exact simulation setup."""
+    opt_dir = os.path.join(args.outdir, args.optimizer)
+    cfg_candidates = [
+        os.path.join(opt_dir, "phase_trajectory_config.json"),
+        # Backward compatibility for result folders produced before the
+        # role-based script rename.
+        os.path.join(opt_dir, "main_exp1_config.json"),
+    ]
+    cfg_path = next((p for p in cfg_candidates if os.path.isfile(p)), cfg_candidates[0])
+    if not args.plot_only or not os.path.isfile(cfg_path):
+        return args
+    with open(cfg_path) as jf:
+        cfg = json.load(jf)
+    preserve = {
+        "outdir", "plot_only", "skip_plot", "dpi", "tau_cap",
+        "min_r2", "min_beta_r2",
+    }
+    for key, value in cfg.items():
+        if key not in preserve and hasattr(args, key):
+            setattr(args, key, value)
+    log(f"[plot_only] loaded run configuration from {cfg_path}")
+    return args
+
+
 def main():
     args = parse_args()
+    args = _load_run_config_for_plot_only(args)
 
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     if not seeds:
@@ -502,8 +554,10 @@ def main():
     log(f"Models: {all_models}")
     log(f"Output: {opt_dir}")
 
-    # Save orchestration config
-    with open(os.path.join(opt_dir, "main_exp1_config.json"), "w") as jf:
+    # Save orchestration config.  Preserve the simulation manifest during
+    # plot_only analysis; write analysis settings separately.
+    config_name = "phase_trajectory_analysis_config.json" if args.plot_only else "phase_trajectory_config.json"
+    with open(os.path.join(opt_dir, config_name), "w") as jf:
         json.dump(vars(args), jf, indent=2)
 
     # ================================================================
@@ -529,7 +583,7 @@ def main():
             }
             log(f"[seed={seed}] Running all models -> {seed_dir}")
             ok = run_simulation(
-                "run_exp1.py",
+                "run_phase_trajectory.py",
                 seed_dir, common_args, run_extra,
                 seed=seed, w_seed=w_seed, log_file=run_log
             )
@@ -537,6 +591,28 @@ def main():
                 log(f"[seed={seed}] OK")
             else:
                 log(f"[seed={seed}] FAILED — see {run_log}")
+
+    if args.plot_only:
+        log("Running deferred final-envelope analysis from saved checkpoints ...")
+        for seed in seeds:
+            seed_tag = f"seed_{seed:04d}"
+            seed_dir = os.path.join(opt_dir, seed_tag)
+            w_seed = args.w_seed_base + seed
+            analysis_log = os.path.join(logs_dir, f"{seed_tag}_analysis.log")
+            run_extra = {
+                "models": args.models,
+                "const_s": args.const_s,
+                "analysis_only": True,
+            }
+            ok = run_simulation(
+                "run_phase_trajectory.py",
+                seed_dir, common_args, run_extra,
+                seed=seed, w_seed=w_seed, log_file=analysis_log,
+            )
+            if ok:
+                log(f"[seed={seed}] analysis OK")
+            else:
+                log(f"[seed={seed}] analysis FAILED — see {analysis_log}")
 
     # ================================================================
     # STEP 2: Aggregate phase trajectories
@@ -583,7 +659,8 @@ def main():
     # STEP 2c: Copy raw checkpoint artifacts + aggregate final-only outputs
     # ================================================================
     # Raw checkpoint directories are copied from one exemplar seed for audit plots.
-    # Final envelope / phase artifacts are aggregated across seeds below.
+    # Final envelope / phase artifacts are present only after the deferred
+    # plot_only analysis pass; when present, aggregate them across seeds below.
     log("Copying exemplar checkpoint data and aggregating final artifacts ...")
     last_seed_dir = seed_dirs[-1] if seed_dirs else None
     if last_seed_dir:
@@ -623,7 +700,8 @@ def main():
                     "p_beta_lt1_mean", "p_beta_lt1_se",
                     "beta_env_mean", "beta_env_se",
                     "alpha_hat_mean", "alpha_hat_se",
-                    "tau_mean_mean", "tau_mean_se"]
+                    "tau_mean_mean", "tau_mean_se",
+                    "delta_zeta_mean", "delta_zeta_se"]
     summary_rows = []
     for model_name in all_models:
         agg = aggregate_trajectories(seed_dirs, model_name)
@@ -632,7 +710,7 @@ def main():
         # Use the last epoch
         n_s = agg.get("n_seeds", 0)
         row = [model_name, n_s]
-        for col in ["beta_hat", "beta_median", "p_beta_lt1", "beta_env", "alpha_hat", "tau_mean"]:
+        for col in ["beta_hat", "beta_median", "p_beta_lt1", "beta_env", "alpha_hat", "tau_mean", "delta_zeta"]:
             m_key = f"{col}_mean"
             se_key = f"{col}_se"
             if m_key in agg and len(agg[m_key]) > 0:
@@ -648,8 +726,8 @@ def main():
     log(f"  Summary table saved to {summary_path}")
 
     # Print summary to stdout
-    log(f"  {'Model':<12} {'n':>4}  {'beta_hat':>8}  {'b_med':>8}  {'P(b<1)':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}")
-    log(f"  {'-'*12} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}")
+    log(f"  {'Model':<12} {'n':>4}  {'beta_hat':>8}  {'b_med':>8}  {'P(b<1)':>8}  {'beta_env':>8}  {'alpha_hat':>8}  {'tau_mean':>10}  {'Dzeta':>8}")
+    log(f"  {'-'*12} {'-'*4}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*10}  {'-'*8}")
     for r in summary_rows:
         model_name, n_s = r[0], r[1]
         bh_m, bh_se = r[2], r[3]
@@ -658,7 +736,8 @@ def main():
         be_m, be_se = r[8], r[9]
         ah_m, ah_se = r[10], r[11]
         tm_m, tm_se = r[12], r[13]
-        log(f"  {model_name:<12} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {bmed_m:>5.2f}+/-{bmed_se:.2f}  {pbl_m:>5.2f}+/-{pbl_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}")
+        dz_m, dz_se = r[14], r[15]
+        log(f"  {model_name:<12} {n_s:>4}  {bh_m:>5.2f}+/-{bh_se:.2f}  {bmed_m:>5.2f}+/-{bmed_se:.2f}  {pbl_m:>5.2f}+/-{pbl_se:.2f}  {be_m:>5.2f}+/-{be_se:.2f}  {ah_m:>5.2f}+/-{ah_se:.2f}  {tm_m:>7.1f}+/-{tm_se:.1f}  {dz_m:>5.2f}+/-{dz_se:.2f}")
 
     # ================================================================
     # STEP 2e: Aggregate threshold-crossing results across seeds

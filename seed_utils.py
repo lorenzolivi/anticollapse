@@ -6,7 +6,7 @@ Shared utilities for multi-seed experiment pipeline
 =====================================================
 
 Common functions for CSV I/O, file discovery, and cross-seed aggregation.
-Used by main_exp1.py, plot scripts, and simulation scripts.
+Used by main_phase_trajectory.py, plot scripts, and simulation scripts.
 """
 
 import os, csv, re, json
@@ -237,11 +237,22 @@ def _aggregate_crossover_records(cd_records: List[Dict]) -> Optional[Dict[str, A
     if majority_mode == "anti_collapsed":
         numeric_fields = [
             "ell_star", "n_below", "n_above",
+            "power_window_beta", "power_window_beta_min",
+            "power_window_local_beta", "power_window_local_r2",
+            "power_window_n_points", "power_window_min_required_points",
+            "runs_power_window_n_runs", "runs_power_window_z", "runs_power_window_p",
             "runs_below_n_runs", "runs_below_z", "runs_below_p",
             "sign_above_n_neg", "sign_above_n_total", "sign_above_p",
         ]
         out.update(_aggregate_numeric_fields(cd_majority, numeric_fields))
-        for flag in ("runs_below_pass", "sign_above_pass"):
+        for flag in (
+            "power_law_window_pass",
+            "power_window_beta_pass",
+            "power_window_size_pass",
+            "runs_power_window_pass",
+            "runs_below_pass",
+            "sign_above_pass",
+        ):
             flags = [bool(r.get(flag)) for r in cd_majority if flag in r]
             out[flag + "_fraction"] = (
                 float(sum(flags)) / len(flags) if flags else None
@@ -250,14 +261,24 @@ def _aggregate_crossover_records(cd_records: List[Dict]) -> Optional[Dict[str, A
     elif majority_mode == "collapsed":
         numeric_fields = [
             "r2_exp", "runs_exp_n_runs", "runs_exp_z", "runs_exp_p",
+            "power_window_beta", "power_window_beta_min",
+            "power_window_local_beta", "power_window_local_r2",
+            "power_window_n_points", "power_window_min_required_points",
+            "runs_power_window_n_runs", "runs_power_window_z", "runs_power_window_p",
         ]
         out.update(_aggregate_numeric_fields(cd_majority, numeric_fields))
-        flags = [bool(r.get("runs_exp_pass")) for r in cd_majority
-                 if "runs_exp_pass" in r]
-        out["runs_exp_pass_fraction"] = (
-            float(sum(flags)) / len(flags) if flags else None
-        )
-        out["runs_exp_pass"] = bool(sum(flags) > len(flags) / 2) if flags else False
+        for flag in (
+            "power_law_window_pass",
+            "power_window_beta_pass",
+            "power_window_size_pass",
+            "runs_power_window_pass",
+            "runs_exp_pass",
+        ):
+            flags = [bool(r.get(flag)) for r in cd_majority if flag in r]
+            out[flag + "_fraction"] = (
+                float(sum(flags)) / len(flags) if flags else None
+            )
+            out[flag] = bool(sum(flags) > len(flags) / 2) if flags else False
 
     return out
 
@@ -356,7 +377,10 @@ def aggregate_final_phase_jsons(paths: List[str]) -> Optional[Dict[str, Any]]:
             "tail_beta_hat", "tail_beta_r2",
             "boot_beta_median", "boot_beta_lo", "boot_beta_hi",
             "boot_p_beta_lt1", "boot_B_effective",
+            "zeta_q10", "zeta_q90", "delta_zeta",
             "ell_star", "phase_r2_threshold",
+            "power_window_beta_min", "power_window_min_points",
+            "power_window_min_fraction",
         ],
     ))
 
@@ -403,6 +427,7 @@ PHASE_TRAJ_COLS = [
     "beta_hat", "beta_r2",
     "beta_median", "beta_lo", "beta_hi", "p_beta_lt1", "beta_bootstrap_B_eff",
     "tau_mean", "tau_q90", "tau_q99",
+    "zeta_q10", "zeta_q90", "delta_zeta",
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
