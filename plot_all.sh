@@ -12,8 +12,6 @@
 #   ./plot_all.sh exp1_figs   [smoke|full]
 #   ./plot_all.sh exp2        [smoke|full]
 #   ./plot_all.sh exp2_figs   [smoke|full]
-#   ./plot_all.sh exp3        [smoke|full]
-#   ./plot_all.sh exp3_figs   [smoke|full]
 #   ./plot_all.sh all         [smoke|full]
 #
 # The optional profile defaults to "full" and selects the default result
@@ -38,25 +36,21 @@ usage() {
 plot_all.sh - plotting / analysis launcher for Anti-Collapse
 
 Usage:
-    ./plot_all.sh exp1        [smoke|full]   plot ConstGate negative-control results
-    ./plot_all.sh exp1_inject [smoke|full]   plot ConstGate injected-forcing results
+    ./plot_all.sh exp1        [smoke|full]   plot ConstGate negative-control results, both paths
+    ./plot_all.sh exp1_inject [smoke|full]   plot ConstGate injected-forcing Path A only
     ./plot_all.sh exp1_figs   [smoke|full]   regenerate ONLY the Exp 1 Path A vs Path B
                                              comparison figures (drift, final spectrum)
                                              and mirror per-path envelope plots into
-                                             $EXP1_FIG_DIR — skips main_phase_trajectory and drift
-    ./plot_all.sh exp2        [smoke|full]   plot phase-trajectory/capacity results
-                                             (capacity ladder: shared,diag,gru,lstm)
-    ./plot_all.sh exp2_figs   [smoke|full]   regenerate ONLY the Exp 2 capacity-ladder
+                                             $EXP1_FIG_DIR — skips main_phase_trajectory,
+                                             drift, and zeta-residual diagnostics
+    ./plot_all.sh exp2        [smoke|full]   plot SharedGate/DiagGate access-route results
+    ./plot_all.sh exp2_figs   [smoke|full]   regenerate ONLY the Exp 2 access-route
                                              comparison figures (forcing, beta_env, drift,
-                                             final spectrum, Delta zeta,
-                                             phase-summary, t_cross) and mirror
+                                             final spectrum, Delta zeta) and mirror
                                              per-architecture envelope plots into
-                                             $EXP2_FIG_DIR — skips main_phase_trajectory and drift
-    ./plot_all.sh exp3        [smoke|full]   plot forcing-ablation results
-    ./plot_all.sh exp3_figs   [smoke|full]   regenerate ONLY the Exp 3 ablation
-                                             comparison figures and markdown summary
-                                             into $EXP3_FIG_DIR — skips main_forcing_ablation
-    ./plot_all.sh all         [smoke|full]   plot exp1, exp1_inject, exp2, exp3 result sets
+                                             $EXP2_FIG_DIR — skips main_phase_trajectory,
+                                             drift, and zeta-residual diagnostics
+    ./plot_all.sh all         [smoke|full]   plot exp1 and exp2 result sets
     ./plot_all.sh --help                     show this help
 
 Environment overrides:
@@ -68,20 +62,18 @@ Environment overrides:
     EXP2_OUTDIR             explicit Experiment 2 result directory
     EXP2_FIG_DIR            Overleaf-bound folder for exp2 figures (default: results/exp2_figures)
     EXP2_FIG_DPI            DPI for exp2 figures (default: 400)
-    EXP3_OUTDIR             explicit Experiment 3 result directory
-    EXP3_FIG_DIR            Overleaf-bound folder for exp3 figures (default: results/exp3_figures)
-    EXP3_FIG_DPI            DPI for exp3 figures (default: 400)
     SEEDS                   comma-separated seeds
-    EXP2_MODELS             default shared,diag,gru,lstm
-    EXP3_MODELS             default diag
+    EXP2_MODELS             default shared,diag
     DPI                     default 600 (general fallback; per-experiment FIG_DPI overrides take precedence)
-    SKIP_DRIFT=1            skip the far-left drift diagnostic regardless of profile
-    RUN_DRIFT_ON_SMOKE=1    enable drift diagnostic on the smoke profile (off by default)
+    SKIP_DRIFT=1            skip drift only when it is not required by the selected profile
+    SKIP_ZETA_RESIDUAL_FORCING=1
+                            skip the post-hoc zeta-residual forcing diagnostic
+    RUN_DRIFT_ON_SMOKE=0    skip drift diagnostic on the smoke profile (on by default)
     SKIP_EXP1_COMPARISON=1  skip the exp1 path-comparison plot block
-    SKIP_EXP2_COMPARISON=1  skip the exp2 capacity-ladder comparison plot block
+    SKIP_EXP2_COMPARISON=1  skip the exp2 access-route comparison plot block
     DRIFT_*                 override drift-script knobs (see body of script)
 
-No simulation is run. This script calls main_phase_trajectory.py/main_forcing_ablation.py with
+No simulation is run. This script calls main_phase_trajectory.py with
 --plot_only to reload saved analysis checkpoints, compute final envelope /
 regime diagnostics, and regenerate aggregations and plots from existing
 per-seed output. For exp1 / exp1_inject the far-left drift plateau is also
@@ -93,7 +85,7 @@ EOF
 }
 
 case "$COMMAND" in
-    exp1|exp1_inject|exp1_figs|exp2|exp2_figs|exp3|exp3_figs|all|--help|-h|help|"") ;;
+    exp1|exp1_inject|exp1_figs|exp2|exp2_figs|all|--help|-h|help|"") ;;
     *)
         echo "Error: unknown command '$COMMAND'." >&2
         usage
@@ -107,21 +99,17 @@ fi
 case "$PROFILE" in
     smoke)
         SEEDS="${SEEDS:-47}"
-        EXP2_MODELS="${EXP2_MODELS:-shared,diag,gru}"
-        EXP3_MODELS="${EXP3_MODELS:-diag}"
-        EXP3_BATCH_VALUES="${EXP3_BATCH_VALUES:-1024}"
-        EXP3_CLIP_VALUES="${EXP3_CLIP_VALUES:-0.1}"
-        EXP3_WINSOR_VALUES="${EXP3_WINSOR_VALUES:-95}"
-        WARMUP_EPOCHS="${WARMUP_EPOCHS:-40}"
+        EXP2_MODELS="${EXP2_MODELS:-shared,diag}"
+        RUN_DRIFT_ON_SMOKE="${RUN_DRIFT_ON_SMOKE:-1}"
+        DRIFT_TAIL_BOOTSTRAP_B="${DRIFT_TAIL_BOOTSTRAP_B:-500}"
+        ZETA_RESIDUAL_TAIL_BOOTSTRAP_B="${ZETA_RESIDUAL_TAIL_BOOTSTRAP_B:-50}"
         ;;
     full)
-        SEEDS="${SEEDS:-47,83,12,69,31}"
-        EXP2_MODELS="${EXP2_MODELS:-shared,diag,gru,lstm}"
-        EXP3_MODELS="${EXP3_MODELS:-diag}"
-        EXP3_BATCH_VALUES="${EXP3_BATCH_VALUES:-2048,4096,8192}"
-        EXP3_CLIP_VALUES="${EXP3_CLIP_VALUES:-0.1,0.01,0.001}"
-        EXP3_WINSOR_VALUES="${EXP3_WINSOR_VALUES:-95,90,80}"
-        WARMUP_EPOCHS="${WARMUP_EPOCHS:-200}"
+        SEEDS="${SEEDS:-47,83,12,69,31,104,218,337,451,592}"
+        EXP2_MODELS="${EXP2_MODELS:-shared,diag}"
+        RUN_DRIFT_ON_SMOKE="${RUN_DRIFT_ON_SMOKE:-0}"
+        DRIFT_TAIL_BOOTSTRAP_B="${DRIFT_TAIL_BOOTSTRAP_B:-3000}"
+        ZETA_RESIDUAL_TAIL_BOOTSTRAP_B="${ZETA_RESIDUAL_TAIL_BOOTSTRAP_B:-300}"
         ;;
     *)
         echo "Error: profile must be smoke or full, got '$PROFILE'." >&2
@@ -141,11 +129,6 @@ EXP2_OUTDIR="${EXP2_OUTDIR:-$RESULTS_DIR/exp2_phase_${PROFILE}}"
 # use; override EXP2_FIG_DPI to change.
 EXP2_FIG_DIR="${EXP2_FIG_DIR:-$RESULTS_DIR/exp2_figures}"
 EXP2_FIG_DPI="${EXP2_FIG_DPI:-400}"
-EXP3_OUTDIR="${EXP3_OUTDIR:-$RESULTS_DIR/exp3_forcing_${PROFILE}}"
-EXP3_FIG_DIR="${EXP3_FIG_DIR:-$RESULTS_DIR/exp3_figures}"
-EXP3_FIG_DPI="${EXP3_FIG_DPI:-400}"
-
-EXP3_CONDITIONS="${EXP3_CONDITIONS:-baseline,batch_ablation,clip_ablation,winsorize_ablation}"
 
 check_dir() {
     local dir="$1"
@@ -158,15 +141,14 @@ check_dir() {
 }
 
 # ------------------------------------------------------------
-# Far-left drift diagnostic (one of the five common diagnostic
-# columns of the empirical campaign). Coupled into plot_all.sh
+# Far-left drift diagnostic (one of the reported route observables).
+# Coupled into plot_all.sh
 # so re-running the analysis on updated checkpoints regenerates
 # the drift artifacts in lockstep, preventing stale drift output.
 #
-# Skipped on the smoke profile by default (single-seed bootstrap
-# is not statistically informative); set RUN_DRIFT_ON_SMOKE=1 to
-# enable it for pipeline-integrity coverage. SKIP_DRIFT=1 is a
-# universal escape hatch.
+# Run on the smoke profile by default for pipeline-integrity coverage. The
+# single-seed smoke bootstrap is not used as evidence, but it should prove that
+# the drift artifacts are generated. Set RUN_DRIFT_ON_SMOKE=0 to skip.
 # ------------------------------------------------------------
 DRIFT_LATE_FRACTION="${DRIFT_LATE_FRACTION:-0.35}"
 DRIFT_MIN_LATE_CHECKPOINTS="${DRIFT_MIN_LATE_CHECKPOINTS:-4}"
@@ -177,31 +159,70 @@ DRIFT_TAIL_TRIM_FRACTION="${DRIFT_TAIL_TRIM_FRACTION:-0.1}"
 DRIFT_TAIL_BOOTSTRAP_B="${DRIFT_TAIL_BOOTSTRAP_B:-3000}"
 DRIFT_TAIL_CI_LEVEL="${DRIFT_TAIL_CI_LEVEL:-0.90}"
 
+# Post-hoc forcing diagnostic on the SDE coordinate itself. This reads saved
+# checkpoint tau spectra, constructs zeta=-log(tau), subtracts a binned
+# nonparametric drift estimate, and applies the calibrated tail estimator to
+# robustly standardized far-left residuals. It complements the update-space
+# forcing audit without touching training checkpoints.
+ZETA_RESIDUAL_LATE_FRACTION="${ZETA_RESIDUAL_LATE_FRACTION:-$DRIFT_LATE_FRACTION}"
+ZETA_RESIDUAL_MIN_LATE_CHECKPOINTS="${ZETA_RESIDUAL_MIN_LATE_CHECKPOINTS:-$DRIFT_MIN_LATE_CHECKPOINTS}"
+ZETA_RESIDUAL_SCALE_LATE_FRACTION="${ZETA_RESIDUAL_SCALE_LATE_FRACTION:-0.75}"
+ZETA_RESIDUAL_MIN_SCALE_CHECKPOINTS="${ZETA_RESIDUAL_MIN_SCALE_CHECKPOINTS:-20}"
+ZETA_RESIDUAL_N_BINS="${ZETA_RESIDUAL_N_BINS:-$DRIFT_N_BINS}"
+ZETA_RESIDUAL_TAIL_Q_LOW="${ZETA_RESIDUAL_TAIL_Q_LOW:-0.10}"
+ZETA_RESIDUAL_TRIM_FRACTION="${ZETA_RESIDUAL_TRIM_FRACTION:-$DRIFT_TAIL_TRIM_FRACTION}"
+ZETA_RESIDUAL_MAX_SAMPLES="${ZETA_RESIDUAL_MAX_SAMPLES:-20000}"
+ZETA_RESIDUAL_TAIL_CI_B="${ZETA_RESIDUAL_TAIL_CI_B:-100}"
+ZETA_RESIDUAL_TAIL_K_MIN="${ZETA_RESIDUAL_TAIL_K_MIN:-50}"
+ZETA_RESIDUAL_TAIL_K_FRAC="${ZETA_RESIDUAL_TAIL_K_FRAC:-0.08}"
+ZETA_RESIDUAL_SUBSTANTIVE_ALPHA="${ZETA_RESIDUAL_SUBSTANTIVE_ALPHA:-1.8}"
+ZETA_RESIDUAL_GAUSSIAN_TEST_ALPHA="${ZETA_RESIDUAL_GAUSSIAN_TEST_ALPHA:-0.05}"
+
 run_drift_diagnostic() {
     local outdir="$1"
     local model="$2"
     local label="$3"
+    local seed_list="${4:-$SEEDS}"
+    local require_drift=0
+    if [[ "$PROFILE" == "full" ]]; then
+        require_drift=1
+    fi
+    if [[ "$PROFILE" == "smoke" && ( "${RUN_DRIFT_ON_SMOKE:-0}" == "1" || "${RUN_DRIFT_ON_SMOKE:-}" == "true" ) ]]; then
+        require_drift=1
+    fi
 
     if [[ "${SKIP_DRIFT:-0}" == "1" || "${SKIP_DRIFT:-}" == "true" ]]; then
-        echo "[$label] drift diagnostic: SKIPPED (SKIP_DRIFT=1)"
+        if [[ "$require_drift" == "1" ]]; then
+            echo "[$label] !! ERROR: drift diagnostic SKIPPED via SKIP_DRIFT, but drift is required for this run."
+            echo "[$label] !! WARNING:   The far-left restoring drift is one of the four route signatures;"
+            echo "[$label] !! WARNING:   unset SKIP_DRIFT or set RUN_DRIFT_ON_SMOKE=0 on smoke."
+            return 1
+        else
+            echo "[$label] drift diagnostic: SKIPPED (SKIP_DRIFT=1)"
+        fi
         return 0
     fi
-    if [[ "$PROFILE" == "smoke" && "${RUN_DRIFT_ON_SMOKE:-0}" != "1" ]]; then
+    if [[ "$PROFILE" == "smoke" && "${RUN_DRIFT_ON_SMOKE:-0}" != "1" && "${RUN_DRIFT_ON_SMOKE:-}" != "true" ]]; then
         echo "[$label] drift diagnostic: SKIPPED on smoke profile " \
-             "(set RUN_DRIFT_ON_SMOKE=1 to override; smoke single-seed bootstrap is not informative)"
+             "(RUN_DRIFT_ON_SMOKE=0; smoke single-seed bootstrap is not evidential)"
         return 0
     fi
 
     local opt_dir="$outdir/$OPTIMIZER"
     if [[ ! -d "$opt_dir" ]]; then
-        echo "[$label] drift diagnostic: no $opt_dir directory; skipping"
+        echo "[$label] !! WARNING: drift diagnostic: no $opt_dir directory; skipping (drift will be MISSING)."
+        if [[ "$require_drift" == "1" ]]; then
+            return 1
+        fi
         return 0
     fi
 
     echo "[$label] drift diagnostic on $opt_dir (model=$model)"
-    python "$SCRIPT_DIR/diagnostics/run_restoring_drift.py" \
+    local drift_failed=0
+    if ! python "$SCRIPT_DIR/diagnostics/run_restoring_drift.py" \
         --input_dir "$opt_dir" \
         --model "$model" \
+        --seeds "$seed_list" \
         --outdir "$opt_dir/drift_${model}" \
         --late_fraction "$DRIFT_LATE_FRACTION" \
         --min_late_checkpoints "$DRIFT_MIN_LATE_CHECKPOINTS" \
@@ -210,7 +231,123 @@ run_drift_diagnostic() {
         --tail_q_low_sweep "$DRIFT_TAIL_Q_LOW_SWEEP" \
         --tail_trim_fraction "$DRIFT_TAIL_TRIM_FRACTION" \
         --tail_bootstrap_B "$DRIFT_TAIL_BOOTSTRAP_B" \
-        --tail_ci_level "$DRIFT_TAIL_CI_LEVEL"
+        --tail_ci_level "$DRIFT_TAIL_CI_LEVEL"; then
+        echo "[$label] !! WARNING: drift diagnostic FAILED for model=$model (see error above)."
+        drift_failed=1
+    fi
+    if [[ "$drift_failed" == "1" && "$require_drift" == "1" ]]; then
+        return 1
+    fi
+    # Drift is a required route signature; never let a full run pass silently
+    # without it.
+    if [[ ! -f "$opt_dir/drift_${model}/tail_saturation.json" ]]; then
+        echo "[$label] !! WARNING: drift output $opt_dir/drift_${model}/tail_saturation.json is MISSING after the run."
+        if [[ "$require_drift" == "1" ]]; then
+            echo "[$label] !! WARNING:   The requested analysis is INCOMPLETE without the far-left"
+            echo "[$label] !! WARNING:   restoring-drift artifact for model=$model. Investigate before interpreting."
+            return 1
+        fi
+    fi
+}
+
+run_zeta_residual_forcing() {
+    local outdir="$1"
+    local model="$2"
+    local label="$3"
+    local fig_dir="${4:-}"
+    local fig_prefix="${5:-}"
+    local seed_list="${6:-$SEEDS}"
+
+    if [[ "${SKIP_ZETA_RESIDUAL_FORCING:-0}" == "1" || "${SKIP_ZETA_RESIDUAL_FORCING:-}" == "true" ]]; then
+        echo "[$label] zeta-residual forcing diagnostic: SKIPPED (SKIP_ZETA_RESIDUAL_FORCING=1)"
+        return 0
+    fi
+
+    local opt_dir="$outdir/$OPTIMIZER"
+    if [[ ! -d "$opt_dir" ]]; then
+        echo "[$label] !! WARNING: zeta-residual forcing diagnostic: no $opt_dir directory; skipping."
+        return 0
+    fi
+
+    local zeta_out="$opt_dir/zeta_residual_forcing_${model}"
+    echo "[$label] zeta-residual forcing diagnostic on $opt_dir (model=$model)"
+    local failed=0
+    if ! python "$SCRIPT_DIR/diagnostics/run_zeta_residual_forcing.py" \
+        --input_dir "$opt_dir" \
+        --model "$model" \
+        --seeds "$seed_list" \
+        --outdir "$zeta_out" \
+        --late_fraction "$ZETA_RESIDUAL_LATE_FRACTION" \
+        --min_late_checkpoints "$ZETA_RESIDUAL_MIN_LATE_CHECKPOINTS" \
+        --scale_late_fraction "$ZETA_RESIDUAL_SCALE_LATE_FRACTION" \
+        --min_scale_checkpoints "$ZETA_RESIDUAL_MIN_SCALE_CHECKPOINTS" \
+        --n_bins "$ZETA_RESIDUAL_N_BINS" \
+        --tail_q_low "$ZETA_RESIDUAL_TAIL_Q_LOW" \
+        --trim_fraction "$ZETA_RESIDUAL_TRIM_FRACTION" \
+        --max_samples "$ZETA_RESIDUAL_MAX_SAMPLES" \
+        --tail_bootstrap_B "$ZETA_RESIDUAL_TAIL_BOOTSTRAP_B" \
+        --tail_ci_B "$ZETA_RESIDUAL_TAIL_CI_B" \
+        --tail_k_min "$ZETA_RESIDUAL_TAIL_K_MIN" \
+        --tail_k_frac "$ZETA_RESIDUAL_TAIL_K_FRAC" \
+        --tail_substantive_alpha "$ZETA_RESIDUAL_SUBSTANTIVE_ALPHA" \
+        --tail_gaussian_test_alpha "$ZETA_RESIDUAL_GAUSSIAN_TEST_ALPHA"; then
+        echo "[$label] !! WARNING: zeta-residual forcing diagnostic FAILED for model=$model."
+        failed=1
+    fi
+    if [[ "$failed" == "1" && "$PROFILE" == "full" ]]; then
+        return 1
+    fi
+    if [[ ! -f "$zeta_out/zeta_residual_forcing_metrics.json" ]]; then
+        echo "[$label] !! WARNING: zeta-residual forcing metrics are missing for model=$model."
+        if [[ "$PROFILE" == "full" ]]; then
+            return 1
+        fi
+        return 0
+    fi
+
+    if [[ -n "$fig_dir" && -n "$fig_prefix" ]]; then
+        mkdir -p "$fig_dir"
+        for fname in zeta_residual_logsurvival.png zeta_residual_qq.png; do
+            if [[ -f "$zeta_out/$fname" ]]; then
+                local stem="${fname%.png}"
+                cp "$zeta_out/$fname" "$fig_dir/${fig_prefix}_${stem}.png"
+                echo "[$label]   mirrored $fname -> ${fig_prefix}_${stem}.png"
+            fi
+        done
+    fi
+}
+
+complete_seed_list_for_model() {
+    local opt_dir="$1"
+    local model="$2"
+    local requested="${3:-$SEEDS}"
+    local keep=()
+    IFS=',' read -r -a _seed_list <<< "$requested"
+    for seed in "${_seed_list[@]}"; do
+        seed="$(echo "$seed" | xargs)"
+        [[ -z "$seed" ]] && continue
+        local seed_tag
+        seed_tag="$(printf 'seed_%04d' "$seed")"
+        local model_dir="$opt_dir/$seed_tag/$model"
+        if [[ -f "$model_dir/${model}_final_phase.json" \
+              && -f "$model_dir/${model}_envelope.csv" \
+              && -f "$model_dir/${model}_envelope_fit.json" \
+              && -f "$model_dir/${model}_envelope_fit_curves.csv" ]]; then
+            keep+=("$seed")
+        else
+            echo "[seed-filter:$model] excluding incomplete $seed_tag/$model from aggregate diagnostics" >&2
+        fi
+    done
+    local joined=""
+    local s
+    for s in "${keep[@]}"; do
+        if [[ -z "$joined" ]]; then
+            joined="$s"
+        else
+            joined="$joined,$s"
+        fi
+    done
+    printf '%s' "$joined"
 }
 
 # ------------------------------------------------------------
@@ -277,7 +414,8 @@ run_exp1_path_comparison() {
             --path_a "$path_a" \
             --outdir "$EXP1_FIG_DIR" \
             --dpi "$EXP1_FIG_DPI" \
-            --which all
+            --which all \
+            --tau_cap_mode fit_lag_max
     else
         echo "[$label]   plotting final spectrum only (drift panel skipped due to missing JSON)"
         python "$SCRIPT_DIR/plot_exp1_path_comparison.py" \
@@ -285,8 +423,15 @@ run_exp1_path_comparison() {
             --path_a "$path_a" \
             --outdir "$EXP1_FIG_DIR" \
             --dpi "$EXP1_FIG_DPI" \
-            --which spectrum
+            --which spectrum \
+            --tau_cap_mode fit_lag_max
     fi
+    python "$SCRIPT_DIR/plot_exp1_path_comparison.py" \
+        --path_b "$path_b" \
+        --path_a "$path_a" \
+        --outdir "$EXP1_FIG_DIR" \
+        --dpi "$EXP1_FIG_DPI" \
+        --which spectrum
 
     # Mirror the per-path envelope plot into the comparison-figures folder
     # so everything for Exp 1 lives in one place. We only mirror the one
@@ -300,7 +445,7 @@ run_exp1_path_comparison() {
     # Path B produce byte-identical envelopes. Showing both panels would
     # be redundant. The manuscript's consolidated 3-panel
     # fig:exp1_summary references this single PNG for both paths.
-    for fname in log_envelope_vs_ell.png; do
+    for fname in log_envelope_vs_ell.png envelope_first_order_audit.png; do
         local stem="${fname%.png}"
         if [[ -f "$path_a/plots/$fname" ]]; then
             cp "$path_a/plots/$fname" "$EXP1_FIG_DIR/exp1_${stem}_pathA.png"
@@ -315,23 +460,38 @@ run_exp1_path_comparison() {
     python "$SCRIPT_DIR/write_exp1_summary.py" \
         --path_a "$path_a" \
         --path_b "$path_b" \
-        --model const
+        --model const \
+        --output "$RESULTS_DIR/exp1_results_summary.md"
 }
 
 plot_exp1() {
     check_dir "$EXP1_OUTDIR" "Experiment 1"
+    check_dir "$EXP1_INJECT_OUTDIR" "Experiment 1 injected-forcing"
     echo "============================================================"
-    echo "Plotting Experiment 1: ConstGate structural negative control"
+    echo "Plotting Experiment 1: ConstGate structural negative control (both paths)"
     echo "============================================================"
-    echo "outdir: $EXP1_OUTDIR"
+    echo "path_b: $EXP1_OUTDIR"
+    echo "path_a: $EXP1_INJECT_OUTDIR"
     python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP1_OUTDIR" \
+        --experiment_tag exp1 \
         --seeds "$SEEDS" \
         --models const \
         --optimizer "$OPTIMIZER" \
         --dpi "$DPI" \
         --plot_only
     run_drift_diagnostic "$EXP1_OUTDIR" "const" "exp1"
+    run_zeta_residual_forcing "$EXP1_OUTDIR" "const" "exp1" "$EXP1_FIG_DIR" "exp1_pathB"
+    python "$SCRIPT_DIR/main_phase_trajectory.py" \
+        --outdir "$EXP1_INJECT_OUTDIR" \
+        --experiment_tag exp1 \
+        --seeds "$SEEDS" \
+        --models const \
+        --optimizer "$OPTIMIZER" \
+        --dpi "$DPI" \
+        --plot_only
+    run_drift_diagnostic "$EXP1_INJECT_OUTDIR" "const" "exp1_inject"
+    run_zeta_residual_forcing "$EXP1_INJECT_OUTDIR" "const" "exp1_inject" "$EXP1_FIG_DIR" "exp1_pathA"
     run_exp1_path_comparison "exp1"
 }
 
@@ -343,19 +503,21 @@ plot_exp1_inject() {
     echo "outdir: $EXP1_INJECT_OUTDIR"
     python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP1_INJECT_OUTDIR" \
+        --experiment_tag exp1 \
         --seeds "$SEEDS" \
         --models const \
         --optimizer "$OPTIMIZER" \
         --dpi "$DPI" \
         --plot_only
     run_drift_diagnostic "$EXP1_INJECT_OUTDIR" "const" "exp1_inject"
+    run_zeta_residual_forcing "$EXP1_INJECT_OUTDIR" "const" "exp1_inject" "$EXP1_FIG_DIR" "exp1_pathA"
     run_exp1_path_comparison "exp1_inject"
 }
 
 # ------------------------------------------------------------
-# Exp 2 capacity-ladder comparison plots
+# Exp 2 SharedGate/DiagGate access-route comparison plots
 # (forcing trajectory, beta_env, drift plateau, final spectrum,
-#  Delta zeta, phase summary, t_cross), plus per-architecture envelope
+#  Delta zeta), plus per-architecture envelope
 # mirroring into the Overleaf-bound figure folder.
 #
 # Reads only from already-aggregated files under
@@ -367,17 +529,17 @@ run_exp2_phase_ladder() {
     local label="$1"
 
     if [[ "${SKIP_EXP2_COMPARISON:-0}" == "1" || "${SKIP_EXP2_COMPARISON:-}" == "true" ]]; then
-        echo "[$label] exp2 capacity-ladder plots: SKIPPED (SKIP_EXP2_COMPARISON=1)"
+        echo "[$label] exp2 access-route plots: SKIPPED (SKIP_EXP2_COMPARISON=1)"
         return 0
     fi
 
     local opt_dir="$EXP2_OUTDIR/$OPTIMIZER"
     if [[ ! -d "$opt_dir" ]]; then
-        echo "[$label] exp2 capacity-ladder plots: SKIPPED (directory $opt_dir not found; run anticollapse.sh exp2 first)"
+        echo "[$label] exp2 access-route plots: SKIPPED (directory $opt_dir not found; run anticollapse.sh exp2 first)"
         return 0
     fi
 
-    echo "[$label] exp2 capacity-ladder plots: $opt_dir"
+    echo "[$label] exp2 access-route plots: $opt_dir"
     echo "[$label]   outdir=$EXP2_FIG_DIR  dpi=$EXP2_FIG_DPI  architectures=$EXP2_MODELS"
     IFS=',' read -r -a _arch_list <<< "$EXP2_MODELS"
 
@@ -390,24 +552,28 @@ run_exp2_phase_ladder() {
         fi
     done
 
+    local paper_figs=(forcing beta_env spectrum envelope delta_zeta)
     if [[ "$has_any_drift" == "1" ]]; then
+        paper_figs+=(drift)
+    else
+        echo "[$label]   no exp2 drift tail_saturation.json files found; plotting non-drift figures only"
+    fi
+
+    for fig in "${paper_figs[@]}"; do
         python "$SCRIPT_DIR/plot_exp2_phase_ladder.py" \
             --exp2_dir "$opt_dir" \
             --outdir "$EXP2_FIG_DIR" \
             --architectures "$EXP2_MODELS" \
             --dpi "$EXP2_FIG_DPI" \
-            --which all
-    else
-        echo "[$label]   no exp2 drift tail_saturation.json files found; plotting non-drift figures only"
-        for fig in forcing beta_env spectrum delta_zeta phase_summary t_cross; do
-            python "$SCRIPT_DIR/plot_exp2_phase_ladder.py" \
-                --exp2_dir "$opt_dir" \
-                --outdir "$EXP2_FIG_DIR" \
-                --architectures "$EXP2_MODELS" \
-                --dpi "$EXP2_FIG_DPI" \
-                --which "$fig"
-        done
-    fi
+            --which "$fig"
+    done
+    python "$SCRIPT_DIR/plot_exp2_phase_ladder.py" \
+        --exp2_dir "$opt_dir" \
+        --outdir "$EXP2_FIG_DIR" \
+        --architectures "$EXP2_MODELS" \
+        --dpi "$EXP2_FIG_DPI" \
+        --which spectrum \
+        --tau_cap_mode fit_lag_max
 
     # Regenerate the markdown results summary from the same aggregates the
     # plots are driven from, so the LaTeX section and the figures stay in
@@ -417,7 +583,7 @@ run_exp2_phase_ladder() {
         --exp2_dir "$opt_dir" \
         --architectures "$EXP2_MODELS" \
         --profile "$PROFILE" \
-        --seeds "$SEEDS" \
+        --tau_cap_mode seq_len \
         --output "$RESULTS_DIR/exp2_phase_${PROFILE}_results_summary.md"
 
     # Generate and mirror per-architecture envelope plots into the comparison-
@@ -443,11 +609,10 @@ run_exp2_phase_ladder() {
             --outdir "$arch_plot_dir" \
             --dpi "$EXP2_FIG_DPI" \
             --debug 0
-        # Only mirror the one envelope PNG the manuscript actually
-        # references for exp2; the auxiliary envelope_aic_bar / fit_r2 /
-        # mu_vs_ell / crossover_diagnostic plots stay under the per-arch
-        # plots folder for audits and are not paper-bound.
-        for fname in log_envelope_vs_ell.png; do
+        # Mirror audit-only per-architecture envelope diagnostics. The
+        # manuscript-facing Exp2 envelope comparison is generated directly as
+        # exp2_envelope_loglog_comparison.png above.
+        for fname in log_envelope_vs_ell.png envelope_first_order_audit.png; do
             local stem="${fname%.png}"
             if [[ -f "$arch_plot_dir/$fname" ]]; then
                 cp "$arch_plot_dir/$fname" "$EXP2_FIG_DIR/exp2_${stem}_${arch}.png"
@@ -457,88 +622,39 @@ run_exp2_phase_ladder() {
     done
 }
 
-# ------------------------------------------------------------
-# Exp 3 forcing-ablation comparison plots and markdown summary.
-#
-# Reads from $EXP3_OUTDIR/$OPTIMIZER/aggregated after main_forcing_ablation.py has
-# aggregated the condition ladders. This can run standalone once the
-# simulation/aggregation exists.
-# ------------------------------------------------------------
-run_exp3_forcing_ablation() {
-    local label="$1"
-    local opt_dir="$EXP3_OUTDIR/$OPTIMIZER"
-    local agg_dir="$opt_dir/aggregated"
-
-    if [[ ! -d "$agg_dir" ]]; then
-        echo "[$label] exp3 ablation plots: SKIPPED (directory $agg_dir not found; run anticollapse.sh exp3 first)"
-        return 0
-    fi
-
-    echo "[$label] exp3 ablation plots: $agg_dir"
-    echo "[$label]   outdir=$EXP3_FIG_DIR  dpi=$EXP3_FIG_DPI  models=$EXP3_MODELS"
-    mkdir -p "$EXP3_FIG_DIR"
-
-    python "$SCRIPT_DIR/plot_exp3_forcing_ablation.py" \
-        --agg_dir "$agg_dir" \
-        --outdir "$EXP3_FIG_DIR" \
-        --models "$EXP3_MODELS" \
-        --dpi "$EXP3_FIG_DPI" \
-        --which all
-
-    echo "[$label] writing exp3 results summary"
-    python "$SCRIPT_DIR/write_exp3_summary.py" \
-        --agg_dir "$agg_dir" \
-        --models "$EXP3_MODELS" \
-        --output "$RESULTS_DIR/exp3_forcing_${PROFILE}_results_summary.md"
-}
-
 plot_exp2() {
     check_dir "$EXP2_OUTDIR" "Experiment 2"
     echo "============================================================"
-    echo "Plotting Experiment 2: dynamical phase trajectory (capacity ladder)"
+    echo "Plotting Experiment 2: SharedGate/DiagGate access-route test"
     echo "============================================================"
     echo "models: $EXP2_MODELS"
     echo "outdir: $EXP2_OUTDIR"
     python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP2_OUTDIR" \
+        --experiment_tag exp2 \
         --seeds "$SEEDS" \
         --models "$EXP2_MODELS" \
         --optimizer "$OPTIMIZER" \
         --dpi "$DPI" \
         --plot_only
-    # Per-architecture drift diagnostic. We loop over the comma-separated
-    # EXP2_MODELS list so each rung of the capacity ladder gets its own
-    # drift_<arch>/ output, which the capacity-ladder comparison plot then
-    # picks up. SKIP_DRIFT=1 / RUN_DRIFT_ON_SMOKE=1 still apply.
+    # Per-architecture drift diagnostic. We loop over EXP2_MODELS so the
+    # SharedGate reference and DiagGate candidate each get drift_<arch>/ output.
+    # Smoke drift is on by default; RUN_DRIFT_ON_SMOKE=0 / SKIP_DRIFT=1 can
+    # disable it when this is not a required analysis pass.
     IFS=',' read -r -a _arch_list <<< "$EXP2_MODELS"
     for arch in "${_arch_list[@]}"; do
         arch="$(echo "$arch" | xargs)"
         [[ -z "$arch" ]] && continue
-        run_drift_diagnostic "$EXP2_OUTDIR" "$arch" "exp2:$arch"
+        arch_seeds="$(complete_seed_list_for_model "$EXP2_OUTDIR/$OPTIMIZER" "$arch" "$SEEDS")"
+        if [[ -z "$arch_seeds" ]]; then
+            echo "[exp2:$arch] !! ERROR: no complete seeds available for $arch"
+            return 1
+        fi
+        echo "[exp2:$arch] complete seed list for aggregate diagnostics: $arch_seeds"
+        run_drift_diagnostic "$EXP2_OUTDIR" "$arch" "exp2:$arch" "$arch_seeds"
+        run_zeta_residual_forcing "$EXP2_OUTDIR" "$arch" "exp2:$arch" "$EXP2_FIG_DIR" "exp2_${arch}" "$arch_seeds"
     done
     run_exp2_phase_ladder "exp2"
-}
-
-plot_exp3() {
-    check_dir "$EXP3_OUTDIR" "Experiment 3"
-    echo "============================================================"
-    echo "Plotting Experiment 3: stochastic-forcing ablation"
-    echo "============================================================"
-    echo "models: $EXP3_MODELS"
-    echo "outdir: $EXP3_OUTDIR"
-    python "$SCRIPT_DIR/main_forcing_ablation.py" \
-        --outdir "$EXP3_OUTDIR" \
-        --seeds "$SEEDS" \
-        --models "$EXP3_MODELS" \
-        --optimizer "$OPTIMIZER" \
-        --conditions "$EXP3_CONDITIONS" \
-        --batch_ablation_values "$EXP3_BATCH_VALUES" \
-        --clip_ablation_values "$EXP3_CLIP_VALUES" \
-        --winsorize_ablation_values "$EXP3_WINSOR_VALUES" \
-        --warmup_epochs "$WARMUP_EPOCHS" \
-        --dpi "$DPI" \
-        --plot_only
-    run_exp3_forcing_ablation "exp3"
 }
 
 case "$COMMAND" in
@@ -562,28 +678,17 @@ case "$COMMAND" in
         plot_exp2
         ;;
     exp2_figs)
-        # Standalone: only regenerate the capacity-ladder comparison
+        # Standalone: only regenerate the access-route comparison
         # figures + mirror the per-architecture envelope plots, without
         # re-running main_phase_trajectory.py --plot_only or the drift diagnostic.
         # Reads from the already-on-disk EXP2_OUTDIR.
         echo "============================================================"
-        echo "Regenerating Exp 2 capacity-ladder figures (no main_phase_trajectory re-run)"
+        echo "Regenerating Exp 2 access-route figures (no main_phase_trajectory re-run)"
         echo "============================================================"
         run_exp2_phase_ladder "exp2_figs"
         ;;
-    exp3)
-        plot_exp3
-        ;;
-    exp3_figs)
-        echo "============================================================"
-        echo "Regenerating Exp 3 forcing-ablation figures (no main_forcing_ablation re-run)"
-        echo "============================================================"
-        run_exp3_forcing_ablation "exp3_figs"
-        ;;
     all)
         plot_exp1
-        plot_exp1_inject
         plot_exp2
-        plot_exp3
         ;;
 esac

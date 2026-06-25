@@ -5,9 +5,8 @@
 Anti-Collapse — phase-trajectory runner (single seed)
 =====================================================
 
-Trains all 5 gated RNN architectures (ConstGate, SharedGate, DiagGate, GRU, LSTM)
-on a synthetic long-memory regression task and tracks the dynamical trajectory
-in the (α̂, β̂) phase plane during training.
+Trains one or more gated recurrent architectures on a synthetic long-memory
+regression task and records the diagnostic trajectory during training.
 
 This is the unified version that handles all architectures in a single script,
 using shared modules (models, transport, diagnostics, data).
@@ -30,7 +29,7 @@ Top-level:
 NO plotting here.
 
 Usage:
-  python run_phase_trajectory.py --outdir results/exp2_phase/seed_0042 --seed 42 --models shared,diag,gru,lstm
+  python run_phase_trajectory.py --outdir results/exp2_phase/seed_0042 --seed 42 --models shared,diag
 """
 
 import argparse
@@ -57,15 +56,14 @@ from seed_utils import write_csv, append_csv_row
 
 
 # ============================================================
-# Heavy-tailed gradient-noise injection (Path A: enforced C1)
+# Heavy-tailed forcing injection
 # ============================================================
 #
-# Optional symmetric α-stable noise injection on the parameter gradients,
-# enabled by --inject_alpha_noise > 0. Intent: test C3 (capacity-realizability)
-# cleanly by enforcing α<2 on the effective forcing by construction, then
-# checking whether the constrained pair (e.g. ConstGate+AdamW) still fails
-# to broaden the spectrum. When --inject_alpha_noise == 0 (default), the
-# training loop is unchanged.
+# The paper-facing Path A intervention uses --inject_mode update: after the
+# optimizer step, soft-tapered symmetric alpha-stable noise is added to the
+# slow-unit rows of trainable parameters. This perturbs the training-time
+# update driver without directly corrupting sequence-time hidden states. The
+# older state/grad modes remain available for debug/comparison runs.
 
 def _stable_sample_symmetric(
     alpha: float,
@@ -74,6 +72,8 @@ def _stable_sample_symmetric(
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator,
+    clip: float = 0.0,
+    taper: str = "hard",
 ) -> torch.Tensor:
     """Symmetric α-stable sample via Chambers-Mallows-Stuck.
 
@@ -99,6 +99,12 @@ def _stable_sample_symmetric(
         cos_U = torch.cos(U).clamp_min(eps)
         cos_au = torch.cos((alpha - 1.0) * U).clamp_min(eps)
         X = (sin_aU / cos_U.pow(1.0 / alpha)) * (cos_au / W).pow((1.0 - alpha) / alpha)
+    if float(clip) > 0.0:
+        clip = float(clip)
+        if str(taper).lower() == "soft":
+            X = clip * torch.tanh(X / clip)
+        else:
+            X = X.clamp(-clip, clip)
     return X.mul_(float(scale))
 
 
@@ -107,6 +113,7 @@ def apply_alpha_stable_grad_injection(
     alpha: float,
     scale_multiplier: float,
     generator: torch.Generator,
+    noise_clip: float = 0.0,
 ) -> Dict[str, float]:
     """Add symmetric α-stable noise to all trainable parameter gradients in place.
 
@@ -139,6 +146,7 @@ def apply_alpha_stable_grad_injection(
         noise = _stable_sample_symmetric(
             alpha=alpha, scale=c, shape=g.shape,
             device=g.device, dtype=g.dtype, generator=generator,
+            clip=float(noise_clip),
         )
         g.add_(noise)
         n_params_injected += 1
@@ -149,6 +157,7 @@ def apply_alpha_stable_grad_injection(
         "injected": 1.0,
         "alpha": float(alpha),
         "scale_multiplier": float(scale_multiplier),
+        "noise_clip": float(noise_clip),
         "n_params_injected": float(n_params_injected),
         "avg_dispersion_per_element": float(avg_disp),
     }
@@ -156,6 +165,8 @@ def apply_alpha_stable_grad_injection(
 
 def _build_injection_generator(args, device: torch.device):
     """Construct per-run RNG for stable-noise injection, or return None."""
+    if str(getattr(args, "inject_mode", "none")) == "none":
+        return None
     if float(getattr(args, "inject_alpha_noise", 0.0)) <= 0.0:
         return None
     seed_offset = int(getattr(args, "inject_grad_seed_offset", 1729))
@@ -167,11 +178,15 @@ def _build_injection_generator(args, device: torch.device):
 
 def _save_injection_metadata(mdir: str, args, info: Dict[str, float]) -> None:
     """Persist injection settings to <mdir>/injection_metadata.json."""
+    if str(getattr(args, "inject_mode", "none")) == "none":
+        return
     if float(getattr(args, "inject_alpha_noise", 0.0)) <= 0.0:
         return
     out = {
+        "inject_mode": str(getattr(args, "inject_mode", "none")),
         "inject_alpha_noise": float(args.inject_alpha_noise),
         "inject_alpha": float(args.inject_alpha),
+        "inject_noise_clip": float(getattr(args, "inject_noise_clip", 0.0)),
         "inject_grad_seed_offset": int(args.inject_grad_seed_offset),
         "inject_seed_used": int(args.seed) + int(args.inject_grad_seed_offset),
         "first_step_summary": info,
@@ -179,6 +194,198 @@ def _save_injection_metadata(mdir: str, args, info: Dict[str, float]) -> None:
     path = os.path.join(mdir, "injection_metadata.json")
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
+
+
+def _initial_state_injection_mask(H: int, q_low: float, device: torch.device) -> torch.Tensor:
+    """Deterministic mask used before the first tau-based far-left slice exists."""
+    n = max(1, int(math.ceil(float(q_low) * int(H))))
+    mask = torch.zeros(int(H), dtype=torch.bool, device=device)
+    mask[:n] = True
+    return mask
+
+
+def _far_left_mask_from_tau(tau: np.ndarray, H: int, q_low: float, device: torch.device) -> torch.Tensor:
+    """Select units in the far-left zeta slice, equivalently the largest taus."""
+    tau = np.asarray(tau, dtype=np.float64)
+    valid = np.isfinite(tau) & (tau > 0)
+    mask_np = np.zeros(int(H), dtype=bool)
+    if np.any(valid):
+        zeta = np.full(int(H), np.nan, dtype=np.float64)
+        zeta[valid] = -np.log(tau[valid])
+        thr = np.nanquantile(zeta[valid], float(q_low))
+        mask_np = valid & (zeta <= thr)
+    if not np.any(mask_np):
+        mask_np[:max(1, int(math.ceil(float(q_low) * int(H))))] = True
+    return torch.as_tensor(mask_np, dtype=torch.bool, device=device)
+
+
+def _selected_slow_rows(param: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Return the leading-dimension slow rows selected by ``mask``."""
+    return param[mask] if param.ndim >= 1 else param
+
+
+def _is_slow_row_parameter(name: str, param: torch.Tensor, H: int) -> bool:
+    """Parameter selector for slow-relevant update rows.
+
+    A unit q's effective-rate dynamics are attached to tensors whose leading
+    dimension indexes hidden units. This includes input/recurrent rows and,
+    for DiagGate, per-unit gate rows. Shared gates and readout weights are
+    naturally excluded because their leading dimension is not H.
+    """
+    if (not param.requires_grad) or param.ndim < 1:
+        return False
+    if str(name).startswith("out."):
+        return False
+    return int(param.shape[0]) == int(H)
+
+
+def _snapshot_slow_row_params(
+    model: torch.nn.Module,
+    slow_mask: torch.Tensor,
+    H: int,
+) -> Dict[str, torch.Tensor]:
+    """Snapshot selected slow rows before the optimizer step."""
+    snap: Dict[str, torch.Tensor] = {}
+    mask = slow_mask.to(dtype=torch.bool)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if _is_slow_row_parameter(name, p, H):
+                snap[name] = _selected_slow_rows(p.detach(), mask).clone()
+    return snap
+
+
+def _append_update_forcing_samples(
+    buffer: Dict[str, object],
+    total_update: torch.Tensor,
+    injected_update: torch.Tensor,
+) -> None:
+    """Append flattened update samples, keeping a bounded recent window."""
+    max_samples = int(buffer.get("max_samples", 20000))
+    if max_samples <= 0:
+        return
+
+    def _to_np(x: torch.Tensor) -> np.ndarray:
+        arr = x.detach().reshape(-1).to("cpu").numpy().astype(np.float64)
+        arr = arr[np.isfinite(arr)]
+        if arr.size > max_samples:
+            idx = np.linspace(0, arr.size - 1, num=max_samples, dtype=int)
+            arr = arr[idx]
+        return arr
+
+    for key, tensor in (("total", total_update), ("injected", injected_update)):
+        arr = _to_np(tensor)
+        if arr.size == 0:
+            continue
+        chunks = buffer.setdefault(key, [])
+        chunks.append(arr)
+        merged = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        if merged.size > max_samples:
+            merged = merged[-max_samples:]
+        buffer[key] = [merged]
+
+
+def _update_forcing_payload(
+    buffer: Dict[str, object],
+    slow_mask: torch.Tensor,
+    q_low: float,
+) -> Dict[str, object]:
+    """Materialize and reset the update-forcing buffer for diagnostics."""
+    total_chunks = buffer.get("total", [])
+    injected_chunks = buffer.get("injected", [])
+    total = np.concatenate(total_chunks) if total_chunks else np.empty(0, dtype=np.float64)
+    injected = np.concatenate(injected_chunks) if injected_chunks else np.empty(0, dtype=np.float64)
+    payload = {
+        "total": total,
+        "injected": injected,
+        "n_slow_units": int(slow_mask.detach().to("cpu").sum().item()),
+        "slow_fraction": float(slow_mask.detach().to("cpu").float().mean().item()) if slow_mask.numel() else float("nan"),
+        "slow_q_low": float(q_low),
+    }
+    buffer["total"] = []
+    buffer["injected"] = []
+    return payload
+
+
+def apply_update_space_injection(
+    model: torch.nn.Module,
+    pre_step_snapshot: Dict[str, torch.Tensor],
+    slow_mask: torch.Tensor,
+    args,
+    generator: torch.Generator | None,
+    update_buffer: Dict[str, object],
+) -> Dict[str, float]:
+    """Inject soft-tapered stable noise into slow-row post-Adam updates."""
+    H = int(args.H)
+    mask = slow_mask.to(dtype=torch.bool)
+    inject_active = (
+        str(getattr(args, "inject_mode", "none")).lower() == "update"
+        and generator is not None
+        and float(getattr(args, "inject_alpha_noise", 0.0)) > 0.0
+    )
+    n_params = 0
+    n_elements = 0
+    total_disp = 0.0
+
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name not in pre_step_snapshot or not _is_slow_row_parameter(name, p, H):
+                continue
+            before = pre_step_snapshot[name].to(device=p.device, dtype=p.dtype)
+            after = _selected_slow_rows(p.data, mask)
+            adam_delta = after - before
+            if adam_delta.numel() == 0:
+                continue
+
+            noise = torch.zeros_like(adam_delta)
+            if inject_active:
+                rms = torch.linalg.vector_norm(adam_delta.detach()).item() / max(math.sqrt(adam_delta.numel()), 1e-37)
+                scale = float(getattr(args, "inject_alpha_noise", 0.0)) * float(rms)
+                if scale > 0.0:
+                    noise = _stable_sample_symmetric(
+                        alpha=float(getattr(args, "inject_alpha", 1.5)),
+                        scale=scale,
+                        shape=adam_delta.shape,
+                        device=p.device,
+                        dtype=p.dtype,
+                        generator=generator,
+                        clip=float(getattr(args, "inject_noise_clip", 0.0)),
+                        taper="soft",
+                    )
+                    if p.ndim == 1:
+                        p.data[mask] = p.data[mask] + noise
+                    else:
+                        p.data[mask, ...] = p.data[mask, ...] + noise
+                    total_disp += scale * int(noise.numel())
+
+            _append_update_forcing_samples(update_buffer, adam_delta + noise, noise)
+            n_params += 1
+            n_elements += int(adam_delta.numel())
+
+    return {
+        "injected": 1.0 if inject_active else 0.0,
+        "mode": "update",
+        "alpha": float(getattr(args, "inject_alpha", 1.5)),
+        "scale_multiplier": float(getattr(args, "inject_alpha_noise", 0.0)),
+        "noise_clip": float(getattr(args, "inject_noise_clip", 0.0)),
+        "noise_taper": "soft_tanh",
+        "slow_mode_q_low": float(getattr(args, "slow_mode_q_low", 0.10)),
+        "n_slow_units_targeted": float(mask.detach().to("cpu").sum().item()),
+        "n_params_targeted": float(n_params),
+        "n_elements_targeted": float(n_elements),
+        "avg_dispersion_per_element": float(total_disp / max(1, n_elements)),
+    }
+
+
+def _state_injection_summary(mask: torch.Tensor, args) -> Dict[str, float]:
+    return {
+        "injected": 1.0,
+        "mode": "state",
+        "alpha": float(args.inject_alpha),
+        "scale_multiplier": float(args.inject_alpha_noise),
+        "noise_clip": float(getattr(args, "inject_noise_clip", 0.0)),
+        "slow_mode_q_low": float(getattr(args, "slow_mode_q_low", 0.10)),
+        "n_state_units_targeted": float(mask.detach().to("cpu").sum().item()),
+    }
 
 
 # ============================================================
@@ -240,6 +447,22 @@ TRAJ_COLS = [
     "tau_fit_r2_mean", "tau_fit_n_valid",
     "fit_lags_min", "fit_lags_max",
     "alpha_reliable", "alpha_method", "n_samples",
+    "forcing_alpha_hat", "forcing_alpha_hill", "forcing_alpha_pickands",
+    "forcing_alpha_moment",
+    "forcing_alpha_eff", "forcing_alpha_eff_lo", "forcing_alpha_eff_hi",
+    "forcing_xi_hat", "forcing_alpha_moment_raw", "forcing_alpha_hill_raw",
+    "forcing_alpha_reliable",
+    "forcing_alpha_detectably_heavy",
+    "forcing_alpha_substantively_heavy",
+    "forcing_alpha_resolvably_heavy",
+    "forcing_alpha_substantive_threshold",
+    "forcing_gaussian_test_alpha",
+    "forcing_gaussian_p_value", "forcing_gaussian_p_value_lo", "forcing_gaussian_p_value_hi",
+    "forcing_gaussian_p_value_mc_se",
+    "forcing_gaussian_p_value_floor", "forcing_gaussian_p_value_at_floor",
+    "forcing_gaussian_reject",
+    "forcing_alpha2_band_lo", "forcing_alpha2_band_hi",
+    "forcing_heavy_fraction", "forcing_n_samples", "forcing_k_selected",
     "beta_env", "beta_env_r2",
     "phase_label",
 ]
@@ -331,14 +554,42 @@ def train_with_phase_tracking(
     log(f"[train:{model_name}] start epochs={args.epochs} bs={bs} "
         f"opt={args.optimizer} lr={args.lr}")
 
-    # Heavy-tailed gradient-noise injection (Path A). Inactive when
-    # --inject_alpha_noise == 0 (the default).
+    # Heavy-tailed forcing injection (Path A). Inactive when
+    # --inject_mode none or --inject_alpha_noise == 0.
+    inject_mode = str(getattr(args, "inject_mode", "none")).lower()
     injection_gen = _build_injection_generator(args, device)
+    state_injection = None
     if injection_gen is not None:
         log(f"[train:{model_name}] heavy-tailed forcing injection ENABLED: "
+            f"mode={inject_mode}, "
             f"alpha={float(args.inject_alpha):.3f}, "
             f"scale_multiplier={float(args.inject_alpha_noise):.3g}, "
             f"seed={int(args.seed) + int(args.inject_grad_seed_offset)}")
+        if inject_mode in {"state", "update"}:
+            slow_mask = _initial_state_injection_mask(
+                H=int(args.H),
+                q_low=float(getattr(args, "slow_mode_q_low", 0.10)),
+                device=device,
+            )
+        if inject_mode == "state":
+            state_injection = {
+                "alpha": float(args.inject_alpha),
+                "scale_multiplier": float(args.inject_alpha_noise),
+                "noise_clip": float(getattr(args, "inject_noise_clip", 0.0)),
+                "mask": slow_mask,
+                "generator": injection_gen,
+            }
+    if "slow_mask" not in locals():
+        slow_mask = _initial_state_injection_mask(
+            H=int(args.H),
+            q_low=float(getattr(args, "slow_mode_q_low", 0.10)),
+            device=device,
+        )
+    update_forcing_buffer: Dict[str, object] = {
+        "total": [],
+        "injected": [],
+        "max_samples": int(getattr(args, "forcing_tail_max_samples", 20000)),
+    }
     _inject_metadata_saved = False
 
     nan_halt = False
@@ -360,7 +611,8 @@ def train_with_phase_tracking(
 
             opt.zero_grad(set_to_none=True)
             yhat, _, _ = model.forward_with_intermediates(
-                xb, return_intermediates=False
+                xb, return_intermediates=False,
+                state_injection=state_injection,
             )
             loss = F.mse_loss(yhat, yb)
 
@@ -378,21 +630,40 @@ def train_with_phase_tracking(
                     model.parameters(), float(args.grad_clip)
                 )
 
-            # Heavy-tailed gradient-noise injection (Path A). Applied AFTER
-            # grad clipping so the heavy tail is not destroyed by a hard
-            # global norm cap. No-op when the generator is None.
-            if injection_gen is not None:
+            # Legacy gradient-noise injection. The manuscript Path A uses
+            # update injection below; this mode is retained only for comparison.
+            if injection_gen is not None and inject_mode == "grad":
                 _inj_info = apply_alpha_stable_grad_injection(
                     model=model,
                     alpha=float(args.inject_alpha),
                     scale_multiplier=float(args.inject_alpha_noise),
                     generator=injection_gen,
+                    noise_clip=float(getattr(args, "inject_noise_clip", 0.0)),
                 )
                 if not _inject_metadata_saved:
                     _save_injection_metadata(mdir, args, _inj_info)
                     _inject_metadata_saved = True
+            elif injection_gen is not None and inject_mode == "state" and not _inject_metadata_saved:
+                _save_injection_metadata(
+                    mdir,
+                    args,
+                    _state_injection_summary(state_injection["mask"], args),
+                )
+                _inject_metadata_saved = True
 
+            pre_step_snapshot = _snapshot_slow_row_params(model, slow_mask, int(args.H))
             opt.step()
+            _update_info = apply_update_space_injection(
+                model=model,
+                pre_step_snapshot=pre_step_snapshot,
+                slow_mask=slow_mask,
+                args=args,
+                generator=injection_gen,
+                update_buffer=update_forcing_buffer,
+            )
+            if injection_gen is not None and inject_mode == "update" and not _inject_metadata_saved:
+                _save_injection_metadata(mdir, args, _update_info)
+                _inject_metadata_saved = True
             global_step += 1
 
             loss_sum += float(loss.item()) * int(hi - lo)
@@ -416,9 +687,29 @@ def train_with_phase_tracking(
                 Xtr_cpu, Ytr_cpu, Xdg_cpu,
                 device=device, fit_lags=fit_lags, ells=ells,
                 step=global_step,
+                update_forcing_samples=_update_forcing_payload(
+                    update_forcing_buffer,
+                    slow_mask=slow_mask,
+                    q_low=float(getattr(args, "slow_mode_q_low", 0.10)),
+                ),
             )
             append_csv_row(traj_csv, [row[k] for k in TRAJ_COLS])
             trajectory_rows.append(row)
+
+            if state_injection is not None or inject_mode == "update":
+                tau_path = os.path.join(
+                    mdir, "checkpoint_taus", f"ckpt_{int(ep):04d}_taus.npy"
+                )
+                if os.path.isfile(tau_path):
+                    tau_ckpt = np.load(tau_path)
+                    slow_mask = _far_left_mask_from_tau(
+                        tau_ckpt,
+                        H=int(args.H),
+                        q_low=float(getattr(args, "slow_mode_q_low", 0.10)),
+                        device=device,
+                    )
+                    if state_injection is not None:
+                        state_injection["mask"] = slow_mask
 
             # Optionally save model checkpoint
             if getattr(args, 'save_model_checkpoints', False):
@@ -496,7 +787,7 @@ def analyze_final_envelope_for_model(
     ells: np.ndarray,
     fit_lags: np.ndarray,
 ) -> None:
-    """Load a final analysis checkpoint and compute final envelope verdicts."""
+    """Load a final analysis checkpoint and compute final diagnostics."""
     mdir = os.path.join(outdir, model_name)
     ckpt_path = os.path.join(mdir, "analysis_checkpoint", "final.pt")
     if not os.path.isfile(ckpt_path):
@@ -546,7 +837,7 @@ def parse_args():
 
     # Output / seeds
     p.add_argument("--outdir", type=str, required=True)
-    p.add_argument("--models", type=str, default="const,shared,diag,gru,lstm",
+    p.add_argument("--models", type=str, default="const,shared,diag",
                    help="Comma-separated model names")
     p.add_argument("--seed", type=int, default=321)
     p.add_argument("--w_seed", type=int, default=41,
@@ -569,17 +860,20 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
 
-    # Heavy-tailed gradient-noise injection (Path A: enforced C1).
-    # Set --inject_alpha_noise > 0 to enable. Noise is added per-element
-    # to all trainable parameter gradients AFTER grad clipping, with
-    # symmetric α-stable distribution of stability index --inject_alpha
-    # and dispersion = (--inject_alpha_noise) * (||grad_p||/sqrt(numel_p))
-    # per parameter.
+    # Heavy-tailed forcing injection. The manuscript Path A uses
+    # --inject_mode update; state/grad are retained only as legacy comparison
+    # modes.
+    p.add_argument("--inject_mode", type=str, default="none",
+                   choices=["none", "update", "state", "grad"],
+                   help="Heavy-tailed forcing injection target: none, update, legacy state, or legacy grad.")
     p.add_argument("--inject_alpha_noise", type=float, default=0.0,
-                   help="Multiplier on per-parameter (||grad||/sqrt(numel)) for "
-                        "heavy-tailed gradient-noise injection. 0 disables (default).")
-    p.add_argument("--inject_alpha", type=float, default=1.6,
+                   help="Scale multiplier for heavy-tailed forcing injection. 0 disables.")
+    p.add_argument("--inject_alpha", type=float, default=1.5,
                    help="Stability index α∈(0,2] of the injected α-stable noise.")
+    p.add_argument("--inject_noise_clip", type=float, default=100.0,
+                   help="Bound the standardized α-stable draw before scaling. Update-mode "
+                        "uses a soft tanh taper; legacy state/grad modes use hard clipping. "
+                        "0 disables the bound.")
     p.add_argument("--inject_grad_seed_offset", type=int, default=1729,
                    help="Offset added to --seed for the injection RNG (reproducibility).")
 
@@ -626,6 +920,26 @@ def parse_args():
     p.add_argument("--alpha_method", type=str, default="ecf",
                    choices=["mcculloch", "ecf"])
     p.add_argument("--min_samples_alpha", type=int, default=500)
+
+    # Slow-mode forcing tail diagnostic.
+    p.add_argument("--slow_mode_q_low", type=float, default=0.10,
+                   help="Far-left zeta quantile used for slow-mode forcing measurement.")
+    p.add_argument("--forcing_tail_max_samples", type=int, default=20000,
+                   help="Maximum absolute increment samples used by the slow-mode tail estimator.")
+    p.add_argument("--forcing_tail_bootstrap_B", type=int, default=200,
+                   help="Synthetic-stable draws per alpha for the calibration curve.")
+    p.add_argument("--forcing_tail_ci_B", type=int, default=100,
+                   help="Data-bootstrap resamples for the effective-alpha CI.")
+    p.add_argument("--forcing_tail_k_min", type=int, default=50,
+                   help="Minimum upper-order statistic count for the calibrated EVI estimator.")
+    p.add_argument("--forcing_tail_k_frac", type=float, default=0.08,
+                   help="Genuine-tail order-statistic fraction (k = k_frac * n) for the EVI estimator.")
+    p.add_argument("--forcing_tail_k_max_frac", type=float, default=0.20,
+                   help="Deprecated legacy stability-scan upper bound; unused by the calibrated estimator.")
+    p.add_argument("--forcing_tail_substantive_alpha", type=float, default=1.8,
+                   help="Substantive heaviness cutoff: alpha_eff_hi must be <= this value.")
+    p.add_argument("--forcing_tail_gaussian_test_alpha", type=float, default=0.05,
+                   help="One-sided calibrated Gaussian-boundary test level for the slow-mode tail statistic.")
 
     # Tau fit
     p.add_argument("--tau_fit_lag_min", type=int, default=64)

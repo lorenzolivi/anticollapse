@@ -97,8 +97,21 @@ def infer_display_name(input_dir: str, model: str, runs) -> str:
     return os.path.basename(os.path.abspath(input_dir))
 
 
-def discover_model_runs(input_dir: str, model: str):
+def _parse_seed_filter(seeds: str):
+    if not seeds:
+        return None
+    out = set()
+    for s in str(seeds).split(","):
+        s = s.strip()
+        if not s:
+            continue
+        out.add(f"seed_{int(s):04d}")
+    return out
+
+
+def discover_model_runs(input_dir: str, model: str, seeds: str = ""):
     input_dir = os.path.abspath(input_dir)
+    seed_filter = _parse_seed_filter(seeds)
 
     if is_model_dir(input_dir):
         return [{
@@ -112,6 +125,8 @@ def discover_model_runs(input_dir: str, model: str):
         for name in sorted(os.listdir(input_dir)):
             full = os.path.join(input_dir, name)
             if os.path.isdir(full) and SEED_RE.match(name):
+                if seed_filter is not None and name not in seed_filter:
+                    continue
                 seed_dirs.append(full)
 
     runs = []
@@ -799,6 +814,8 @@ def parse_args():
                         help="Model directory or experiment root containing checkpoint_taus data.")
     parser.add_argument("--model", type=str, default=None,
                         help="Model name to analyze when input_dir contains multiple models or seed_* dirs.")
+    parser.add_argument("--seeds", type=str, default="",
+                        help="Optional comma-separated seed filter, e.g. 47,83,12.")
     parser.add_argument("--outdir", type=str, required=True,
                         help="Directory where diagnostic CSV/JSON/PNG outputs will be written.")
     parser.add_argument("--late_fraction", type=float, default=0.3,
@@ -839,7 +856,7 @@ def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    runs = discover_model_runs(args.input_dir, args.model)
+    runs = discover_model_runs(args.input_dir, args.model, seeds=args.seeds)
     display_name = infer_display_name(args.input_dir, args.model, runs)
 
     log(f"Found {len(runs)} run(s) for {display_name}")

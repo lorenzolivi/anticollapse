@@ -32,6 +32,8 @@ import torch.nn.functional as F
 from transport import compute_mu_tl_for_lag
 from seed_utils import write_csv, append_csv_row
 
+_FORCING_CALIBRATION_CACHE: Dict[Tuple[int, int, int, float], Dict[str, Dict[str, float]]] = {}
+
 
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1156,9 +1158,9 @@ def compute_and_save_final_envelopes(
 ) -> Dict[str, object]:
     """
     Save the transport-only envelope bundle plus GELR-weighted comparison
-    files.  If a tau spectrum is provided (or fit_lags are given so one
-    can be extracted), also performs the definitive phase classification
-    using the full envelope decision rule (Table 1 in the paper).
+    files. If a tau spectrum is provided (or fit_lags are given so one
+    can be extracted), the function also records the phase label produced
+    by the envelope/spectrum diagnostic rule.
     """
     env = compute_macro_envelope_comparison(
         model_name=model_name,
@@ -1553,7 +1555,7 @@ def crossover_residual_diagnostic(
 ) -> Dict:
     """Residual-based power-law-window / crossover diagnostic (Section 7).
 
-    For an anti-collapsed verdict, the envelope must contain a sustained
+    For an anti-collapsed label, the envelope must contain a sustained
     power-law window.  This is stricter than accepting a non-exponential
     AIC winner: the tempered model nests degenerate limits and can win
     by absorbing minor exponential-envelope wobble.  We therefore require
@@ -1910,6 +1912,7 @@ def _stable_sample_symmetric_for_diagnostics(
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator,
+    clip: float = 0.0,
 ) -> torch.Tensor:
     """Symmetric α-stable sample used to mirror injected update forcing."""
     if not (0.0 < alpha <= 2.0):
@@ -1926,6 +1929,8 @@ def _stable_sample_symmetric_for_diagnostics(
         cos_U = torch.cos(U).clamp_min(eps)
         cos_au = torch.cos((alpha - 1.0) * U).clamp_min(eps)
         X = (sin_aU / cos_U.pow(1.0 / alpha)) * (cos_au / W).pow((1.0 - alpha) / alpha)
+    if float(clip) > 0.0:
+        X = X.clamp(-float(clip), float(clip))
     return X.mul_(float(scale))
 
 
@@ -1934,6 +1939,7 @@ def _apply_diagnostic_alpha_stable_injection(
     alpha: float,
     scale_multiplier: float,
     generator: torch.Generator,
+    noise_clip: float = 0.0,
 ) -> None:
     """Add the same per-parameter α-stable forcing used during injected training.
 
@@ -1962,6 +1968,7 @@ def _apply_diagnostic_alpha_stable_injection(
             device=g.device,
             dtype=g.dtype,
             generator=generator,
+            clip=float(noise_clip),
         ))
 
 
@@ -1977,6 +1984,7 @@ def _collect_grad_projections(
     winsorize_pct: Optional[float] = None,
     inject_alpha_noise: float = 0.0,
     inject_alpha: float = 1.6,
+    inject_noise_clip: float = 0.0,
     inject_generator: Optional[torch.Generator] = None,
 ) -> np.ndarray:
     """
@@ -2026,6 +2034,7 @@ def _collect_grad_projections(
                     model,
                     alpha=float(inject_alpha),
                     scale_multiplier=float(inject_alpha_noise),
+                    noise_clip=float(inject_noise_clip),
                     generator=inject_generator,
                 )
 
@@ -2034,6 +2043,566 @@ def _collect_grad_projections(
 
     model.train(was_training) if was_training else model.eval()
     return samples
+
+
+# ============================================================
+# Slow-mode state-increment forcing diagnostic
+# ============================================================
+
+def _cms_symmetric_stable_np(alpha: float, size: int, rng: np.random.Generator) -> np.ndarray:
+    """Symmetric alpha-stable samples with unit CMS scale."""
+    eps = 1e-300
+    U = (rng.random(int(size)) - 0.5) * math.pi
+    W = -np.log(np.maximum(rng.random(int(size)), eps))
+    if abs(float(alpha) - 1.0) < 1e-8:
+        return np.tan(U)
+    sin_aU = np.sin(float(alpha) * U)
+    cos_U = np.maximum(np.cos(U), eps)
+    cos_au = np.maximum(np.cos((float(alpha) - 1.0) * U), eps)
+    return (sin_aU / np.power(cos_U, 1.0 / float(alpha))) * (
+        np.power(cos_au / W, (1.0 - float(alpha)) / float(alpha))
+    )
+
+
+def _hill_alpha_from_abs(abs_samples: np.ndarray, k: int) -> float:
+    x = np.sort(np.asarray(abs_samples, dtype=np.float64))
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k = int(k)
+    if n <= k or k < 2:
+        return float("nan")
+    tail = x[-k:]
+    threshold = x[-k - 1]
+    logs = np.log(tail) - math.log(max(float(threshold), 1e-300))
+    gamma = float(np.mean(logs))
+    return float(1.0 / gamma) if gamma > 0 else float("nan")
+
+
+def _pickands_alpha_from_abs(abs_samples: np.ndarray, k: int) -> float:
+    x = np.sort(np.asarray(abs_samples, dtype=np.float64))
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k = int(k)
+    if n <= 4 * k or k < 1:
+        return float("nan")
+    x1 = x[n - k]
+    x2 = x[n - 2 * k]
+    x4 = x[n - 4 * k]
+    num = x1 - x2
+    den = x2 - x4
+    if num <= 0 or den <= 0:
+        return float("nan")
+    gamma = math.log(num / den) / math.log(2.0)
+    return float(1.0 / gamma) if gamma > 0 else float("nan")
+
+
+def _moment_alpha_from_abs(abs_samples: np.ndarray, k: int) -> float:
+    x = np.sort(np.asarray(abs_samples, dtype=np.float64))
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k = int(k)
+    if n <= k or k < 2:
+        return float("nan")
+    threshold = x[-k - 1]
+    y = np.log(x[-k:]) - math.log(max(float(threshold), 1e-300))
+    m1 = float(np.mean(y))
+    m2 = float(np.mean(y * y))
+    if m1 <= 0 or m2 <= 0 or (1.0 - (m1 * m1 / m2)) <= 1e-12:
+        return float("nan")
+    gamma = m1 + 1.0 - 0.5 / (1.0 - (m1 * m1 / m2))
+    return float(1.0 / gamma) if gamma > 0 else float("nan")
+
+
+def _select_hill_k(abs_samples: np.ndarray, k_min: int, k_max_frac: float) -> Tuple[int, List[Dict[str, float]]]:
+    """Select a stable Hill plateau on a k-grid."""
+    x = np.asarray(abs_samples, dtype=np.float64)
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k_min = max(5, int(k_min))
+    k_max = min(max(k_min, int(float(k_max_frac) * n)), max(k_min, n // 4))
+    if n <= 4 * k_min or k_max <= k_min:
+        k = max(2, min(n - 2, int(math.sqrt(max(n, 1)))))
+        return k, [{"k": float(k), "hill": _hill_alpha_from_abs(x, k), "score": float("nan")}]
+    k_grid = np.unique(np.linspace(k_min, k_max, num=min(24, max(4, k_max - k_min + 1)), dtype=int))
+    hills = np.array([_hill_alpha_from_abs(x, int(k)) for k in k_grid], dtype=np.float64)
+    finite = np.isfinite(hills)
+    if not np.any(finite):
+        return int(k_grid[len(k_grid) // 2]), [
+            {"k": float(k), "hill": float(h), "score": float("nan")}
+            for k, h in zip(k_grid, hills)
+        ]
+    med = float(np.nanmedian(hills[finite]))
+    scores = np.full_like(hills, np.nan)
+    for i, h in enumerate(hills):
+        if not np.isfinite(h):
+            continue
+        lo = max(0, i - 2)
+        hi = min(len(hills), i + 3)
+        local = hills[lo:hi]
+        local = local[np.isfinite(local)]
+        local_spread = float(np.std(local)) if local.size > 1 else 0.0
+        scores[i] = abs(float(h) - med) + local_spread
+    idx = int(np.nanargmin(scores))
+    table = [
+        {"k": float(k), "hill": float(h), "score": float(s)}
+        for k, h, s in zip(k_grid, hills, scores)
+    ]
+    return int(k_grid[idx]), table
+
+
+_TAIL_CALIB_CACHE: Dict[tuple, dict] = {}
+_DEFAULT_TAIL_ALPHA_GRID = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.95, 2.0)
+
+
+def _hill_gamma_from_abs(abs_samples: np.ndarray, k: int) -> float:
+    """Hill extreme-value index gamma = 1/alpha (heavy-tail only)."""
+    x = np.sort(np.asarray(abs_samples, dtype=np.float64))
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k = int(k)
+    if n <= k or k < 2:
+        return float("nan")
+    threshold = x[-k - 1]
+    g = float(np.mean(np.log(x[-k:]) - math.log(max(float(threshold), 1e-300))))
+    return g if np.isfinite(g) else float("nan")
+
+
+def _moment_gamma_from_abs(abs_samples: np.ndarray, k: int) -> float:
+    """Dekkers-Einmahl-de Haan moment extreme-value index gamma (xi).
+
+    Unlike Hill, gamma spans light (gamma~0) and heavy (gamma>0) tails, so it
+    does not blow up on near-Gaussian data. The stable tail index is
+    alpha = 1/gamma for gamma>0.
+    """
+    x = np.sort(np.asarray(abs_samples, dtype=np.float64))
+    x = x[np.isfinite(x) & (x > 0)]
+    n = x.size
+    k = int(k)
+    if n <= k or k < 2:
+        return float("nan")
+    threshold = x[-k - 1]
+    y = np.log(x[-k:]) - math.log(max(float(threshold), 1e-300))
+    m1 = float(np.mean(y))
+    m2 = float(np.mean(y * y))
+    if m1 <= 0 or m2 <= 0 or (1.0 - (m1 * m1 / m2)) <= 1e-12:
+        return float("nan")
+    return float(m1 + 1.0 - 0.5 / (1.0 - (m1 * m1 / m2)))
+
+
+def _fixed_tail_k(n: int, k_frac: float, k_min: int) -> int:
+    """Genuine-tail order-statistic count: a fixed fraction of n (floored)."""
+    n = int(n)
+    lo = max(2, int(k_min))
+    return int(max(lo, min(int(round(float(k_frac) * n)), max(lo, n // 4))))
+
+
+def _invert_gamma_curve(gamma_hat: float, alphas: List[float], gamma_med: List[float]) -> float:
+    """Map a measured gamma back to an effective alpha through the calibration
+    median curve gamma(alpha). gamma is monotone decreasing in alpha, so we
+    interpolate on the gamma-sorted curve. Values outside the grid clamp to the
+    nearest endpoint (heavier than the grid floor -> grid-min alpha; lighter
+    than the lightest -> grid-max alpha, i.e. the Gaussian/light end).
+    """
+    a = np.asarray(alphas, dtype=np.float64)
+    g = np.asarray(gamma_med, dtype=np.float64)
+    ok = np.isfinite(a) & np.isfinite(g)
+    a, g = a[ok], g[ok]
+    if not np.isfinite(gamma_hat) or a.size < 2:
+        return float("nan")
+    order = np.argsort(g)
+    gi, ai = g[order], a[order]
+    if gamma_hat <= gi[0]:
+        return float(ai[0])
+    if gamma_hat >= gi[-1]:
+        return float(ai[-1])
+    return float(np.interp(gamma_hat, gi, ai))
+
+
+def estimate_tail_index_calibrated(
+    signed_samples: np.ndarray,
+    k_frac: float = 0.08,
+    k_min: int = 50,
+    calib_B: int = 200,
+    ci_B: int = 100,
+    substantive_alpha_threshold: float = 1.8,
+    gaussian_test_alpha: float = 0.05,
+    alpha_grid: Optional[List[float]] = None,
+    seed: int = 0,
+) -> Dict[str, object]:
+    """Calibration-anchored extreme-value-index estimate of tail heaviness.
+
+    Primary estimator is the moment (DEdH) extreme-value index gamma, which is
+    valid for light and heavy tails. The raw estimate is finite-sample biased
+    for slowly-converging (e.g. stable) tails, so we bias-correct by inverting
+    it through a matched-n synthetic-stable calibration curve (indirect
+    inference), yielding an in-range effective alpha. Gaussian/light channels
+    map to gamma~0 -> effective alpha ~2 (not a spurious >2 Hill value).
+    """
+    grid = list(alpha_grid) if alpha_grid is not None else list(_DEFAULT_TAIL_ALPHA_GRID)
+    s = np.asarray(signed_samples, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    base: Dict[str, object] = {
+        "alpha_eff": float("nan"), "alpha_eff_lo": float("nan"), "alpha_eff_hi": float("nan"),
+        "xi_hat": float("nan"), "alpha_eff_hill": float("nan"),
+        "alpha_moment_raw": float("nan"), "alpha_hill_raw": float("nan"),
+        "detectably_heavy": 0, "substantively_heavy": 0,
+        "resolvably_heavy": 0, "reliable": 0,
+        "substantive_alpha_threshold": float(substantive_alpha_threshold),
+        "gaussian_test_alpha": float(gaussian_test_alpha),
+        "gaussian_p_value": float("nan"), "gaussian_p_value_lo": float("nan"),
+        "gaussian_p_value_hi": float("nan"), "gaussian_p_value_mc_se": float("nan"),
+        "gaussian_p_value_floor": float("nan"), "gaussian_p_value_at_floor": 0,
+        "gaussian_reject": 0,
+        "alpha2_band_lo": float("nan"), "alpha2_band_hi": float("nan"),
+        "n_samples": int(s.size), "k_selected": 0, "calibration": {},
+    }
+    if s.size < max(200, 4 * int(k_min)):
+        return base
+    absx = np.abs(s - float(np.median(s)))
+    absx = absx[np.isfinite(absx) & (absx > 0)]
+    n = int(absx.size)
+    if n < max(200, 4 * int(k_min)):
+        base["n_samples"] = n
+        return base
+    k = _fixed_tail_k(n, k_frac, k_min)
+    gamma_mom = _moment_gamma_from_abs(absx, k)
+    gamma_hill = _hill_gamma_from_abs(absx, k)
+
+    key = (n, k, int(calib_B), tuple(round(float(a), 4) for a in grid))
+    cal = _TAIL_CALIB_CACHE.get(key)
+    if cal is None:
+        rng = np.random.default_rng(913 + 17 * n + 7 * k + 101 * int(calib_B))
+        mom_p05, mom_p50, mom_p95, hill_p50 = [], [], [], []
+        mom_null_alpha2: List[float] = []
+        for a in grid:
+            gm, gh = [], []
+            for _ in range(int(calib_B)):
+                xx = np.abs(_cms_symmetric_stable_np(float(a), n, rng))
+                xx = np.abs(xx - np.median(xx))
+                xx = xx[xx > 0]
+                gv = _moment_gamma_from_abs(xx, k)
+                hv = _hill_gamma_from_abs(xx, k)
+                if np.isfinite(gv):
+                    gm.append(gv)
+                if np.isfinite(hv):
+                    gh.append(hv)
+            if abs(float(a) - 2.0) <= 1e-12:
+                mom_null_alpha2 = list(gm)
+            mom_p05.append(float(np.percentile(gm, 5)) if gm else float("nan"))
+            mom_p50.append(float(np.percentile(gm, 50)) if gm else float("nan"))
+            mom_p95.append(float(np.percentile(gm, 95)) if gm else float("nan"))
+            hill_p50.append(float(np.percentile(gh, 50)) if gh else float("nan"))
+        cal = {"alpha": list(grid), "mom_p05": mom_p05, "mom_p50": mom_p50,
+               "mom_p95": mom_p95, "hill_p50": hill_p50,
+               "_mom_null_alpha2": mom_null_alpha2}
+        _TAIL_CALIB_CACHE[key] = cal
+
+    a_eff = _invert_gamma_curve(gamma_mom, cal["alpha"], cal["mom_p50"])
+    a_eff_hill = _invert_gamma_curve(gamma_hill, cal["alpha"], cal["hill_p50"])
+    g2_p05 = cal["mom_p05"][-1]   # alpha=2 (Gaussian) light band
+    g2_p95 = cal["mom_p95"][-1]
+    null_gamma = np.asarray(cal.get("_mom_null_alpha2", []), dtype=np.float64)
+    null_gamma = null_gamma[np.isfinite(null_gamma)]
+
+    def _gaussian_tail_p(gamma_value: float) -> float:
+        if not np.isfinite(gamma_value) or null_gamma.size == 0:
+            return float("nan")
+        # One-sided calibrated p-value for H0: matched-n Gaussian/light channel
+        # against the heavy-tail alternative gamma > gamma_null.
+        return float((1.0 + np.sum(null_gamma >= gamma_value)) / (null_gamma.size + 1.0))
+
+    gaussian_p_value = _gaussian_tail_p(gamma_mom)
+    gaussian_p_value_floor = (
+        float(1.0 / (null_gamma.size + 1.0)) if null_gamma.size else float("nan")
+    )
+    gaussian_p_value_at_floor = bool(
+        np.isfinite(gaussian_p_value)
+        and np.isfinite(gaussian_p_value_floor)
+        and gaussian_p_value <= gaussian_p_value_floor * (1.0 + 1e-12)
+    )
+    gaussian_p_value_mc_se = (
+        float(math.sqrt(gaussian_p_value * max(1.0 - gaussian_p_value, 0.0) / (null_gamma.size + 1.0)))
+        if np.isfinite(gaussian_p_value) and null_gamma.size else float("nan")
+    )
+    gaussian_test_alpha = float(gaussian_test_alpha)
+    gaussian_reject = bool(
+        np.isfinite(gaussian_p_value)
+        and np.isfinite(gaussian_test_alpha)
+        and gaussian_p_value <= gaussian_test_alpha
+    )
+    detectably_heavy = gaussian_reject
+    a_gauss_lo = _invert_gamma_curve(g2_p95, cal["alpha"], cal["mom_p50"])
+    a_gauss_hi = _invert_gamma_curve(g2_p05, cal["alpha"], cal["mom_p50"])
+
+    rng2 = np.random.default_rng(int(seed) + 12345)
+    bs: List[float] = []
+    bs_p: List[float] = []
+    for _ in range(int(ci_B)):
+        idx = rng2.integers(0, n, n)
+        gg = _moment_gamma_from_abs(absx[idx], k)
+        if np.isfinite(gg):
+            bs.append(_invert_gamma_curve(gg, cal["alpha"], cal["mom_p50"]))
+            pp = _gaussian_tail_p(gg)
+            if np.isfinite(pp):
+                bs_p.append(pp)
+    if bs:
+        a_lo = float(np.percentile(bs, 5))
+        a_hi = float(np.percentile(bs, 95))
+    else:
+        # ci_B=0 is used by fast validation runs. In that case the point
+        # estimate is the only available bound; production profiles use ci_B>0.
+        a_lo = float(a_eff)
+        a_hi = float(a_eff)
+    if bs_p:
+        p_lo = float(np.percentile(bs_p, 5))
+        p_hi = float(np.percentile(bs_p, 95))
+    else:
+        p_lo = float(gaussian_p_value)
+        p_hi = float(gaussian_p_value)
+    reliable = bool(np.isfinite(a_eff) and np.isfinite(a_eff_hill) and abs(a_eff - a_eff_hill) <= 0.3)
+    substantive_alpha_threshold = float(substantive_alpha_threshold)
+    substantively_heavy = bool(
+        detectably_heavy
+        and np.isfinite(a_hi)
+        and np.isfinite(substantive_alpha_threshold)
+        and a_hi <= substantive_alpha_threshold
+    )
+
+    return {
+        "alpha_eff": float(a_eff),
+        "alpha_eff_lo": float(a_lo),
+        "alpha_eff_hi": float(a_hi),
+        "xi_hat": float(gamma_mom),
+        "alpha_eff_hill": float(a_eff_hill),
+        "alpha_moment_raw": float(1.0 / gamma_mom) if (np.isfinite(gamma_mom) and gamma_mom > 0) else float("inf"),
+        "alpha_hill_raw": float(1.0 / gamma_hill) if (np.isfinite(gamma_hill) and gamma_hill > 0) else float("inf"),
+        "detectably_heavy": int(detectably_heavy),
+        "substantively_heavy": int(substantively_heavy),
+        # Backward-compatible name used by plots/summaries. It intentionally
+        # means "detectably below Gaussian AND substantively heavy enough" rather
+        # than merely statistically distinguishable from alpha=2.
+        "resolvably_heavy": int(substantively_heavy),
+        "reliable": int(reliable),
+        "substantive_alpha_threshold": float(substantive_alpha_threshold),
+        "gaussian_test_alpha": float(gaussian_test_alpha),
+        "gaussian_p_value": float(gaussian_p_value),
+        "gaussian_p_value_lo": float(p_lo),
+        "gaussian_p_value_hi": float(p_hi),
+        "gaussian_p_value_mc_se": float(gaussian_p_value_mc_se),
+        "gaussian_p_value_floor": float(gaussian_p_value_floor),
+        "gaussian_p_value_at_floor": int(gaussian_p_value_at_floor),
+        "gaussian_reject": int(gaussian_reject),
+        "alpha2_band_lo": float(a_gauss_lo),
+        "alpha2_band_hi": float(a_gauss_hi),
+        "n_samples": int(n),
+        "k_selected": int(k),
+        "calibration": {k: v for k, v in cal.items() if not str(k).startswith("_")},
+    }
+
+
+def _slow_mode_mask_from_tau(tau: np.ndarray, q_low: float) -> np.ndarray:
+    tau = np.asarray(tau, dtype=np.float64)
+    valid = np.isfinite(tau) & (tau > 0)
+    mask = np.zeros(tau.shape, dtype=bool)
+    if np.any(valid):
+        zeta = np.full(tau.shape, np.nan, dtype=np.float64)
+        zeta[valid] = -np.log(tau[valid])
+        thr = np.nanquantile(zeta[valid], float(q_low))
+        mask = valid & (zeta <= thr)
+    if not np.any(mask) and tau.size:
+        order = np.argsort(np.where(valid, tau, -np.inf))
+        n = max(1, int(math.ceil(float(q_low) * tau.size)))
+        mask[order[-n:]] = True
+    return mask
+
+
+def _collect_state_increment_samples(
+    model: nn.Module,
+    X_cpu: torch.Tensor,
+    device: torch.device,
+    diag_batch_size: int,
+    unit_mask: np.ndarray,
+    max_samples: int,
+    state_injection: Optional[Dict] = None,
+) -> np.ndarray:
+    """Collect hidden-state increments on selected units."""
+    was_training = model.training
+    model.eval()
+    mask_t = torch.as_tensor(unit_mask, dtype=torch.bool, device=device)
+    chunks: List[np.ndarray] = []
+    n_total = 0
+    Btot = int(X_cpu.shape[0])
+    bs = max(1, min(int(diag_batch_size), Btot))
+    max_samples = int(max_samples)
+    with torch.no_grad():
+        for lo in range(0, Btot, bs):
+            if n_total >= max_samples:
+                break
+            xb = X_cpu[lo:lo + bs].to(device, non_blocking=True)
+            _, hseq, _ = model.forward_with_intermediates(
+                xb,
+                return_intermediates=True,
+                state_injection=state_injection,
+            )
+            if hseq is None or hseq.shape[1] < 2:
+                del xb
+                continue
+            inc = hseq[:, 1:, :][:, :, mask_t] - hseq[:, :-1, :][:, :, mask_t]
+            arr = inc.detach().reshape(-1).to("cpu").numpy().astype(np.float64)
+            if arr.size:
+                take = min(arr.size, max_samples - n_total)
+                chunks.append(arr[:take])
+                n_total += take
+            del xb, hseq, inc
+    model.train(was_training) if was_training else model.eval()
+    if not chunks:
+        return np.empty(0, dtype=np.float64)
+    return np.concatenate(chunks)
+
+
+def estimate_slow_mode_forcing_tail(
+    args,
+    model: nn.Module,
+    model_name: str,
+    Xdg_cpu: torch.Tensor,
+    device: torch.device,
+    tau: np.ndarray,
+    epoch: int,
+    update_forcing_samples: Optional[Dict[str, object]] = None,
+) -> Dict:
+    """Tail-only estimate for the slow-mode training-time forcing.
+
+    The preferred observable is the realized post-update increment on the
+    slow-unit parameter rows, supplied by the training loop. Hidden-state
+    increments are retained as a legacy fallback for older analysis paths.
+    """
+    q_low = float(getattr(args, "slow_mode_q_low", 0.10))
+    mask = _slow_mode_mask_from_tau(tau, q_low=q_low)
+    inject_mode = str(getattr(args, "inject_mode", "none")).lower()
+
+    forcing_source = "state_increment"
+    injected_samples = np.empty(0, dtype=np.float64)
+    n_slow_units = int(mask.sum())
+    heavy_fraction = float(mask.mean()) if mask.size else float("nan")
+    samples = np.empty(0, dtype=np.float64)
+
+    if update_forcing_samples is not None:
+        total_arr = np.asarray(update_forcing_samples.get("total", []), dtype=np.float64)
+        total_arr = total_arr[np.isfinite(total_arr)]
+        injected_arr = np.asarray(update_forcing_samples.get("injected", []), dtype=np.float64)
+        injected_arr = injected_arr[np.isfinite(injected_arr)]
+        if total_arr.size:
+            samples = total_arr
+            injected_samples = injected_arr
+            forcing_source = "update_total"
+            n_slow_units = int(update_forcing_samples.get("n_slow_units", n_slow_units))
+            heavy_fraction = float(update_forcing_samples.get("slow_fraction", heavy_fraction))
+
+    if samples.size == 0:
+        state_injection = None
+        if inject_mode == "state" and float(getattr(args, "inject_alpha_noise", 0.0)) > 0.0:
+            gen = torch.Generator(device=device)
+            seed = (
+                int(getattr(args, "seed", 0))
+                + int(getattr(args, "inject_grad_seed_offset", 1729))
+                + 1000003 * int(epoch)
+                + 7919
+            )
+            gen.manual_seed(seed)
+            state_injection = {
+                "alpha": float(getattr(args, "inject_alpha", 1.6)),
+                "scale_multiplier": float(getattr(args, "inject_alpha_noise", 0.0)),
+                "noise_clip": float(getattr(args, "inject_noise_clip", 0.0)),
+                "mask": torch.as_tensor(mask, dtype=torch.bool, device=device),
+                "generator": gen,
+            }
+
+        samples = _collect_state_increment_samples(
+            model=model,
+            X_cpu=Xdg_cpu,
+            device=device,
+            diag_batch_size=int(getattr(args, "diag_batch_size", 256)),
+            unit_mask=mask,
+            max_samples=int(getattr(args, "forcing_tail_max_samples", 20000)),
+            state_injection=state_injection,
+        )
+
+    est = estimate_tail_index_calibrated(
+        samples,
+        k_frac=float(getattr(args, "forcing_tail_k_frac", 0.08)),
+        k_min=int(getattr(args, "forcing_tail_k_min", 50)),
+        calib_B=int(getattr(args, "forcing_tail_bootstrap_B", 200)),
+        ci_B=int(getattr(args, "forcing_tail_ci_B", 100)),
+        substantive_alpha_threshold=float(getattr(args, "forcing_tail_substantive_alpha", 1.8)),
+        gaussian_test_alpha=float(getattr(args, "forcing_tail_gaussian_test_alpha", 0.05)),
+        seed=int(getattr(args, "seed", 0)) + 1000003 * int(epoch),
+    )
+    injected_est = estimate_tail_index_calibrated(
+        injected_samples,
+        k_frac=float(getattr(args, "forcing_tail_k_frac", 0.08)),
+        k_min=int(getattr(args, "forcing_tail_k_min", 50)),
+        calib_B=int(getattr(args, "forcing_tail_bootstrap_B", 200)),
+        ci_B=int(getattr(args, "forcing_tail_ci_B", 100)),
+        substantive_alpha_threshold=float(getattr(args, "forcing_tail_substantive_alpha", 1.8)),
+        gaussian_test_alpha=float(getattr(args, "forcing_tail_gaussian_test_alpha", 0.05)),
+        seed=int(getattr(args, "seed", 0)) + 1000003 * int(epoch) + 424242,
+    ) if injected_samples.size else {}
+    # forcing_alpha_hat is now the calibrated *effective* tail index (in (0,2]);
+    # the moment EVI is primary, Hill is a calibrated cross-check, and the raw
+    # (uncorrected) values are retained under *_raw for audit. Legacy key names
+    # are preserved so existing summaries/plots keep working.
+    return {
+        "forcing_alpha_hat": float(est["alpha_eff"]),
+        "forcing_alpha_eff": float(est["alpha_eff"]),
+        "forcing_alpha_eff_lo": float(est["alpha_eff_lo"]),
+        "forcing_alpha_eff_hi": float(est["alpha_eff_hi"]),
+        "forcing_xi_hat": float(est["xi_hat"]),
+        "forcing_alpha_hill": float(est["alpha_eff_hill"]),
+        "forcing_alpha_pickands": float("nan"),
+        "forcing_alpha_moment": float(est["alpha_eff"]),
+        "forcing_alpha_moment_raw": float(est["alpha_moment_raw"]),
+        "forcing_alpha_hill_raw": float(est["alpha_hill_raw"]),
+        "forcing_alpha_reliable": int(est["reliable"]),
+        "forcing_alpha_detectably_heavy": int(est["detectably_heavy"]),
+        "forcing_alpha_substantively_heavy": int(est["substantively_heavy"]),
+        "forcing_alpha_resolvably_heavy": int(est["resolvably_heavy"]),
+        "forcing_alpha_substantive_threshold": float(est["substantive_alpha_threshold"]),
+        "forcing_gaussian_test_alpha": float(est["gaussian_test_alpha"]),
+        "forcing_gaussian_p_value": float(est["gaussian_p_value"]),
+        "forcing_gaussian_p_value_lo": float(est["gaussian_p_value_lo"]),
+        "forcing_gaussian_p_value_hi": float(est["gaussian_p_value_hi"]),
+        "forcing_gaussian_p_value_mc_se": float(est["gaussian_p_value_mc_se"]),
+        "forcing_gaussian_p_value_floor": float(est["gaussian_p_value_floor"]),
+        "forcing_gaussian_p_value_at_floor": int(est["gaussian_p_value_at_floor"]),
+        "forcing_gaussian_reject": int(est["gaussian_reject"]),
+        "forcing_alpha2_band_lo": float(est["alpha2_band_lo"]),
+        "forcing_alpha2_band_hi": float(est["alpha2_band_hi"]),
+        "forcing_heavy_fraction": heavy_fraction,
+        "forcing_n_samples": int(est["n_samples"]),
+        "forcing_k_selected": int(est["k_selected"]),
+        "forcing_slow_units": int(n_slow_units),
+        "forcing_slow_q_low": q_low,
+        "forcing_source": forcing_source,
+        "forcing_injection_mode": inject_mode,
+        "forcing_injected_alpha_eff": float(injected_est.get("alpha_eff", float("nan"))),
+        "forcing_injected_alpha_eff_lo": float(injected_est.get("alpha_eff_lo", float("nan"))),
+        "forcing_injected_alpha_eff_hi": float(injected_est.get("alpha_eff_hi", float("nan"))),
+        "forcing_injected_detectably_heavy": int(injected_est.get("detectably_heavy", 0)),
+        "forcing_injected_substantively_heavy": int(injected_est.get("substantively_heavy", 0)),
+        "forcing_injected_resolvably_heavy": int(injected_est.get("resolvably_heavy", 0)),
+        "forcing_injected_gaussian_p_value": float(injected_est.get("gaussian_p_value", float("nan"))),
+        "forcing_injected_gaussian_p_value_floor": float(injected_est.get("gaussian_p_value_floor", float("nan"))),
+        "forcing_injected_gaussian_p_value_at_floor": int(injected_est.get("gaussian_p_value_at_floor", 0)),
+        "forcing_injected_gaussian_reject": int(injected_est.get("gaussian_reject", 0)),
+        "forcing_injected_n_samples": int(injected_est.get("n_samples", 0)),
+        "forcing_calibration": est.get("calibration", {}),
+        "forcing_samples_mean": float(np.mean(samples)) if samples.size else float("nan"),
+        "forcing_samples_std": float(np.std(samples)) if samples.size else float("nan"),
+        "forcing_injected_samples_mean": float(np.mean(injected_samples)) if injected_samples.size else float("nan"),
+        "forcing_injected_samples_std": float(np.std(injected_samples)) if injected_samples.size else float("nan"),
+        "model": str(model_name),
+        "epoch": int(epoch),
+    }
 
 
 # ============================================================
@@ -2056,6 +2625,7 @@ def run_checkpoint_diagnostics(
     alpha_batch_size_override: Optional[int] = None,
     alpha_grad_clip_override: Optional[float] = None,
     alpha_winsorize_pct: Optional[float] = None,
+    update_forcing_samples: Optional[Dict[str, object]] = None,
 ) -> Dict:
     """
     Run full diagnostic suite at a training checkpoint.
@@ -2073,7 +2643,7 @@ def run_checkpoint_diagnostics(
     """
     ckpt_tag = f"ckpt_{int(epoch):04d}"
 
-    # --- α estimation (dual-method: ECF + McCulloch) ---
+    # --- Legacy gradient-projection α estimation (ECF + McCulloch) ---
     # Strategy:
     #   1. Collect gradient projections for K random directions
     #   2. Per direction: run McCulloch (works with ≥32 samples)
@@ -2081,15 +2651,18 @@ def run_checkpoint_diagnostics(
     #   4. Report both estimates; flag agreement as reliability indicator
     K = int(getattr(args, 'alpha_n_directions', 5))
     n_grad_batches = int(args.alpha_n_grad_batches_ckpt)
+    inject_mode = str(getattr(args, "inject_mode", "none")).lower()
     inject_alpha_noise = float(getattr(args, "inject_alpha_noise", 0.0))
     inject_alpha = float(getattr(args, "inject_alpha", 1.6))
+    inject_noise_clip = float(getattr(args, "inject_noise_clip", 0.0))
     inject_seed_offset = int(getattr(args, "inject_grad_seed_offset", 1729))
-    injection_forcing_enabled = inject_alpha_noise > 0.0
+    injection_forcing_enabled = (inject_mode == "grad" and inject_alpha_noise > 0.0)
     if alpha_grad_clip_override is not None:
         gc = float(alpha_grad_clip_override)
     else:
-        # In injected-forcing runs the diagnostic should mirror the actual
-        # update forcing, where injection happens after training-time clipping.
+        # Legacy grad-injection mode perturbs clipped gradients directly.
+        # The paper-facing update-space forcing is estimated separately below
+        # by estimate_slow_mode_forcing_tail().
         gc = float(args.grad_clip) if (args.alpha_use_grad_clip or injection_forcing_enabled) else 0.0
     if alpha_batch_size_override is not None:
         bs_alpha = int(alpha_batch_size_override)
@@ -2120,6 +2693,7 @@ def run_checkpoint_diagnostics(
             winsorize_pct=alpha_winsorize_pct,
             inject_alpha_noise=inject_alpha_noise,
             inject_alpha=inject_alpha,
+            inject_noise_clip=inject_noise_clip,
             inject_generator=inject_generator,
         )
         samp_k = samp_k - float(np.mean(samp_k))
@@ -2343,6 +2917,91 @@ def run_checkpoint_diagnostics(
     with open(os.path.join(tau_dir, f"{ckpt_tag}_tau_slope_fit_info.json"), "w") as jf:
         json.dump(tau_fit_info, jf, indent=2)
 
+    # --- Slow-mode forcing tail diagnostic ---
+    forcing_info = estimate_slow_mode_forcing_tail(
+        args=args,
+        model=model,
+        model_name=model_name,
+        Xdg_cpu=Xdg_cpu,
+        device=device,
+        tau=tau,
+        epoch=int(epoch),
+        update_forcing_samples=update_forcing_samples,
+    )
+    forcing_dir = os.path.join(mdir, "checkpoint_forcing_tail")
+    os.makedirs(forcing_dir, exist_ok=True)
+    with open(os.path.join(forcing_dir, f"{ckpt_tag}_slow_mode_forcing_tail.json"), "w") as jf:
+        json.dump(_json_safe(forcing_info), jf, indent=2)
+    write_csv(
+        os.path.join(forcing_dir, f"{ckpt_tag}_slow_mode_forcing_summary.csv"),
+        [
+            "epoch", "model", "forcing_alpha_hat", "forcing_alpha_hill",
+            "forcing_alpha_pickands", "forcing_alpha_moment",
+            "forcing_alpha_eff", "forcing_alpha_eff_lo", "forcing_alpha_eff_hi",
+            "forcing_xi_hat", "forcing_alpha_moment_raw", "forcing_alpha_hill_raw",
+            "forcing_alpha_reliable", "forcing_alpha_detectably_heavy",
+            "forcing_alpha_substantively_heavy", "forcing_alpha_resolvably_heavy",
+            "forcing_alpha_substantive_threshold",
+            "forcing_gaussian_test_alpha", "forcing_gaussian_p_value",
+            "forcing_gaussian_p_value_lo", "forcing_gaussian_p_value_hi",
+            "forcing_gaussian_p_value_mc_se", "forcing_gaussian_p_value_floor",
+            "forcing_gaussian_p_value_at_floor", "forcing_gaussian_reject",
+            "forcing_alpha2_band_lo", "forcing_alpha2_band_hi",
+            "forcing_heavy_fraction", "forcing_n_samples", "forcing_k_selected",
+            "forcing_slow_units", "forcing_source",
+            "forcing_injected_alpha_eff", "forcing_injected_alpha_eff_lo",
+            "forcing_injected_alpha_eff_hi", "forcing_injected_detectably_heavy",
+            "forcing_injected_substantively_heavy", "forcing_injected_resolvably_heavy",
+            "forcing_injected_gaussian_p_value", "forcing_injected_gaussian_p_value_floor",
+            "forcing_injected_gaussian_p_value_at_floor", "forcing_injected_gaussian_reject",
+            "forcing_injected_n_samples",
+        ],
+        [[
+            int(epoch), str(model_name),
+            float(forcing_info["forcing_alpha_hat"]),
+            float(forcing_info["forcing_alpha_hill"]),
+            float(forcing_info["forcing_alpha_pickands"]),
+            float(forcing_info["forcing_alpha_moment"]),
+            float(forcing_info["forcing_alpha_eff"]),
+            float(forcing_info["forcing_alpha_eff_lo"]),
+            float(forcing_info["forcing_alpha_eff_hi"]),
+            float(forcing_info["forcing_xi_hat"]),
+            float(forcing_info["forcing_alpha_moment_raw"]),
+            float(forcing_info["forcing_alpha_hill_raw"]),
+            int(forcing_info["forcing_alpha_reliable"]),
+            int(forcing_info["forcing_alpha_detectably_heavy"]),
+            int(forcing_info["forcing_alpha_substantively_heavy"]),
+            int(forcing_info["forcing_alpha_resolvably_heavy"]),
+            float(forcing_info["forcing_alpha_substantive_threshold"]),
+            float(forcing_info["forcing_gaussian_test_alpha"]),
+            float(forcing_info["forcing_gaussian_p_value"]),
+            float(forcing_info["forcing_gaussian_p_value_lo"]),
+            float(forcing_info["forcing_gaussian_p_value_hi"]),
+            float(forcing_info["forcing_gaussian_p_value_mc_se"]),
+            float(forcing_info["forcing_gaussian_p_value_floor"]),
+            int(forcing_info["forcing_gaussian_p_value_at_floor"]),
+            int(forcing_info["forcing_gaussian_reject"]),
+            float(forcing_info["forcing_alpha2_band_lo"]),
+            float(forcing_info["forcing_alpha2_band_hi"]),
+            float(forcing_info["forcing_heavy_fraction"]),
+            int(forcing_info["forcing_n_samples"]),
+            int(forcing_info["forcing_k_selected"]),
+            int(forcing_info["forcing_slow_units"]),
+            str(forcing_info.get("forcing_source", "")),
+            float(forcing_info.get("forcing_injected_alpha_eff", float("nan"))),
+            float(forcing_info.get("forcing_injected_alpha_eff_lo", float("nan"))),
+            float(forcing_info.get("forcing_injected_alpha_eff_hi", float("nan"))),
+            int(forcing_info.get("forcing_injected_detectably_heavy", 0)),
+            int(forcing_info.get("forcing_injected_substantively_heavy", 0)),
+            int(forcing_info.get("forcing_injected_resolvably_heavy", 0)),
+            float(forcing_info.get("forcing_injected_gaussian_p_value", float("nan"))),
+            float(forcing_info.get("forcing_injected_gaussian_p_value_floor", float("nan"))),
+            int(forcing_info.get("forcing_injected_gaussian_p_value_at_floor", 0)),
+            int(forcing_info.get("forcing_injected_gaussian_reject", 0)),
+            int(forcing_info.get("forcing_injected_n_samples", 0)),
+        ]],
+    )
+
     # --- CCDF + tail fit ---
     tau_sorted, ccdf = compute_ccdf_curve(tau)
 
@@ -2419,10 +3078,10 @@ def run_checkpoint_diagnostics(
         "beta_env_r2": float(env_fit.get("tempered", {}).get("r2", float("nan"))),
     }
 
-    # --- Checkpoint-level phase classification ---
-    # This is still a trajectory diagnostic, not the final publication
-    # verdict, but it uses the same power-law-window gate as the final
-    # analysis so threshold-crossing is not driven by degenerate CCDF tails.
+    # --- Checkpoint-level phase label ---
+    # This is a trajectory diagnostic. It uses the same power-law-window
+    # gate as the final analysis so threshold-crossing metadata is not
+    # driven by degenerate CCDF tails.
     phase_label = classify_phase(
         envelope_winner=str(env_fit.get("envelope_winner", "exponential")),
         tail_r2=float(tail["beta_r2"]),
@@ -2463,6 +3122,34 @@ def run_checkpoint_diagnostics(
         "alpha_reliable": int(alpha_info.get("alpha_reliable", 0)),
         "alpha_method": str(alpha_info.get("alpha_method", "mcculloch_median")),
         "n_samples": int(alpha_info.get("n_samples", 0)),
+        "forcing_alpha_hat": float(forcing_info.get("forcing_alpha_hat", float("nan"))),
+        "forcing_alpha_hill": float(forcing_info.get("forcing_alpha_hill", float("nan"))),
+        "forcing_alpha_pickands": float(forcing_info.get("forcing_alpha_pickands", float("nan"))),
+        "forcing_alpha_moment": float(forcing_info.get("forcing_alpha_moment", float("nan"))),
+        "forcing_alpha_eff": float(forcing_info.get("forcing_alpha_eff", float("nan"))),
+        "forcing_alpha_eff_lo": float(forcing_info.get("forcing_alpha_eff_lo", float("nan"))),
+        "forcing_alpha_eff_hi": float(forcing_info.get("forcing_alpha_eff_hi", float("nan"))),
+        "forcing_xi_hat": float(forcing_info.get("forcing_xi_hat", float("nan"))),
+        "forcing_alpha_moment_raw": float(forcing_info.get("forcing_alpha_moment_raw", float("nan"))),
+        "forcing_alpha_hill_raw": float(forcing_info.get("forcing_alpha_hill_raw", float("nan"))),
+        "forcing_alpha_reliable": int(forcing_info.get("forcing_alpha_reliable", 0)),
+        "forcing_alpha_detectably_heavy": int(forcing_info.get("forcing_alpha_detectably_heavy", 0)),
+        "forcing_alpha_substantively_heavy": int(forcing_info.get("forcing_alpha_substantively_heavy", 0)),
+        "forcing_alpha_resolvably_heavy": int(forcing_info.get("forcing_alpha_resolvably_heavy", 0)),
+        "forcing_alpha_substantive_threshold": float(forcing_info.get("forcing_alpha_substantive_threshold", float("nan"))),
+        "forcing_gaussian_test_alpha": float(forcing_info.get("forcing_gaussian_test_alpha", float("nan"))),
+        "forcing_gaussian_p_value": float(forcing_info.get("forcing_gaussian_p_value", float("nan"))),
+        "forcing_gaussian_p_value_lo": float(forcing_info.get("forcing_gaussian_p_value_lo", float("nan"))),
+        "forcing_gaussian_p_value_hi": float(forcing_info.get("forcing_gaussian_p_value_hi", float("nan"))),
+        "forcing_gaussian_p_value_mc_se": float(forcing_info.get("forcing_gaussian_p_value_mc_se", float("nan"))),
+        "forcing_gaussian_p_value_floor": float(forcing_info.get("forcing_gaussian_p_value_floor", float("nan"))),
+        "forcing_gaussian_p_value_at_floor": int(forcing_info.get("forcing_gaussian_p_value_at_floor", 0)),
+        "forcing_gaussian_reject": int(forcing_info.get("forcing_gaussian_reject", 0)),
+        "forcing_alpha2_band_lo": float(forcing_info.get("forcing_alpha2_band_lo", float("nan"))),
+        "forcing_alpha2_band_hi": float(forcing_info.get("forcing_alpha2_band_hi", float("nan"))),
+        "forcing_heavy_fraction": float(forcing_info.get("forcing_heavy_fraction", float("nan"))),
+        "forcing_n_samples": int(forcing_info.get("forcing_n_samples", 0)),
+        "forcing_k_selected": int(forcing_info.get("forcing_k_selected", 0)),
         "beta_env": float(env_info["beta_env"]),
         "beta_env_r2": float(env_info["beta_env_r2"]),
         "phase_label": str(phase_label),

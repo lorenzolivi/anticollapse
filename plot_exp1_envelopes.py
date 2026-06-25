@@ -7,6 +7,14 @@ import argparse
 import json
 import glob
 import numpy as np
+
+# Headless-safe matplotlib cache, matching the other manuscript plotters.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mplcache"))
+try:
+    os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+except OSError:
+    pass
+
 import matplotlib.pyplot as plt
 
 # Canonical model keys we want in the legend (and order)
@@ -174,6 +182,31 @@ def choose_fit_json_near(env_csv_path: str):
     anyfits = sorted(glob.glob(os.path.join(d, "*_envelope_fit.json")))
     return anyfits[0] if anyfits else None
 
+def choose_audit_csv_near(env_csv_path: str):
+    """Locate the audit CSV containing mu0+mu1 and corr_ratio, if present."""
+    d = os.path.dirname(env_csv_path)
+    audits = sorted(glob.glob(os.path.join(d, "*_envelope_audit.csv")))
+    return audits[0] if audits else None
+
+def read_envelope_audit_csv(path: str):
+    try:
+        data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
+    except Exception:
+        return None
+    data = _as_rows(data)
+    if data is None:
+        return None
+    names = set(data.dtype.names or [])
+    required = {"ell", "log_f_mu0", "log_f_mu0_plus_mu1", "corr_ratio_mu1_over_mu0"}
+    if not required.issubset(names):
+        return None
+    return {
+        "ell": np.asarray(data["ell"], dtype=float),
+        "log_mu0": np.asarray(data["log_f_mu0"], dtype=float),
+        "log_mu0_plus_mu1": np.asarray(data["log_f_mu0_plus_mu1"], dtype=float),
+        "corr_ratio": np.asarray(data["corr_ratio_mu1_over_mu0"], dtype=float),
+    }
+
 def mtime(path: str):
     try:
         return os.path.getmtime(path)
@@ -202,6 +235,8 @@ def main():
     ap.add_argument("--outdir", default=None, help="Where to save plots (default: <indir>/plots_exp1)")
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--debug", type=int, default=1)
+    ap.add_argument("--corr_ratio_threshold", type=float, default=0.25,
+                    help="First-order validity guide: shade / fit only where |mu1|/|mu0| is below this value.")
     args = ap.parse_args()
 
     root = os.path.abspath(args.indir)
@@ -241,6 +276,7 @@ def main():
     env_data = {}
     env_src = {}
     env_fit = {}
+    env_audit = {}
 
     dropped = []
     for k in keys:
@@ -253,6 +289,8 @@ def main():
         env_src[k] = p
         fitp = choose_fit_json_near(p)
         env_fit[k] = safe_load_json(fitp)
+        auditp = choose_audit_csv_near(p)
+        env_audit[k] = read_envelope_audit_csv(auditp) if auditp else None
 
     keys = [k for k in keys if k in env_data]
 
@@ -318,6 +356,53 @@ def main():
         plt.savefig(os.path.join(outdir, "log_envelope_vs_ell.png"), dpi=args.dpi, bbox_inches="tight")
     plt.close()
 
+    # ---- Plot 2b: first-order correction audit
+    for k in keys:
+        audit = env_audit.get(k)
+        if audit is None:
+            continue
+        ell = audit["ell"]
+        mask0 = _mask_log(ell, audit["log_mu0"])
+        mask1 = _mask_log(ell, audit["log_mu0_plus_mu1"])
+        cmask = np.isfinite(ell) & (ell > 0) & np.isfinite(audit["corr_ratio"])
+        if not (np.any(mask0) and np.any(cmask)):
+            continue
+        fig, axes = plt.subplots(2, 1, figsize=(7.0, 6.2), sharex=True,
+                                 gridspec_kw={"height_ratios": [2.0, 1.0]})
+        axes[0].plot(ell[mask0], audit["log_mu0"][mask0], color="#2b6ab8",
+                     linewidth=1.5, label=r"canonical $\mu_0$")
+        if np.any(mask1):
+            axes[0].plot(ell[mask1], audit["log_mu0_plus_mu1"][mask1],
+                         color="#dd8800", linestyle="--", linewidth=1.2,
+                         label=r"audit $\mu_0+\mu_1$")
+        axes[0].set_ylabel(r"$\log \hat f(\ell)$")
+        axes[0].set_title(f"{k} envelope: first-order transport audit")
+        axes[0].grid(True, alpha=0.25)
+        axes[0].legend(fontsize=8)
+
+        ratio = audit["corr_ratio"]
+        axes[1].plot(ell[cmask], ratio[cmask], color="#444444", linewidth=1.3)
+        axes[1].axhline(float(args.corr_ratio_threshold), color="#aa3333",
+                        linestyle="--", linewidth=1.0,
+                        label=rf"threshold={float(args.corr_ratio_threshold):.2f}")
+        axes[1].fill_between(
+            ell[cmask],
+            0.0,
+            ratio[cmask],
+            where=ratio[cmask] <= float(args.corr_ratio_threshold),
+            color="#3aa050",
+            alpha=0.12,
+            label="controlled window",
+        )
+        axes[1].set_xlabel(r"lag $\ell$")
+        axes[1].set_ylabel(r"$|\mu_1|/|\mu_0|$")
+        axes[1].grid(True, alpha=0.25)
+        axes[1].legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "envelope_first_order_audit.png"),
+                    dpi=args.dpi, bbox_inches="tight")
+        plt.close(fig)
+
     # ---- Plot 3: log envelope vs log ell
     plt.figure()
     any_data = False
@@ -338,6 +423,147 @@ def main():
         plt.tight_layout()
         plt.savefig(os.path.join(outdir, "log_envelope_vs_log_ell.png"), dpi=args.dpi, bbox_inches="tight")
     plt.close()
+
+    # ---- Plot 3b: finite-window power-law diagnostic on log-log axes
+    # This is the paper-facing check for whether the envelope has a substantial
+    # finite scaling window. A tempered curve is still shown as the finite-cutoff
+    # continuation, but AIC/model-winner labels are deliberately omitted here:
+    # the visual claim is the quality and length of the power-law window.
+    for k in keys:
+        fit = env_fit.get(k)
+        if not isinstance(fit, dict):
+            continue
+        ell = env_data[k]["ell"].astype(float)
+        log_mu = env_data[k]["log_mu"].astype(float)
+        mask = _mask_log(ell, log_mu)
+        if int(np.sum(mask)) < 6:
+            continue
+        ell_m = ell[mask]
+        log_mu_m = log_mu[mask]
+        log_ell_m = np.log(ell_m + 1e-12)
+
+        fig, ax = plt.subplots(figsize=(7.2, 4.8))
+        ax.plot(log_ell_m, log_mu_m, marker="o", markersize=3.0,
+                linewidth=1.4, label="data", color="#2b6ab8")
+
+        exp_fit = fit.get("exp", {}) or {}
+        if all(x in exp_fit for x in ("a", "b")):
+            pred = float(exp_fit["a"]) + float(exp_fit["b"]) * ell_m
+            ax.plot(log_ell_m, pred, "--", linewidth=1.1,
+                    label=rf"exponential ($R^2={float(exp_fit.get('r2', np.nan)):.3f}$)",
+                    color="#777777")
+
+        pow_fit = fit.get("power", {}) or {}
+        if all(x in pow_fit for x in ("c", "d")):
+            pred = float(pow_fit["c"]) + float(pow_fit["d"]) * log_ell_m
+            beta_pow = max(0.0, -float(pow_fit["d"]))
+            ax.plot(log_ell_m, pred, "-", linewidth=0.9, alpha=0.50,
+                    label=rf"full-window power ($\beta={beta_pow:.3f}$, $R^2={float(pow_fit.get('r2', np.nan)):.3f}$)",
+                    color="#3aa050")
+
+        temp_fit = fit.get("tempered", {}) or {}
+        if all(x in temp_fit for x in ("a", "d_log", "b_ell")):
+            pred = (
+                float(temp_fit["a"])
+                + float(temp_fit["d_log"]) * log_ell_m
+                + float(temp_fit["b_ell"]) * ell_m
+            )
+            ax.plot(log_ell_m, pred, "-.", linewidth=1.1,
+                    label=rf"tempered finite-cutoff ($R^2={float(temp_fit.get('r2', np.nan)):.3f}$)",
+                    color="#dd8800")
+
+        cd = fit.get("crossover_diagnostic", {}) or {}
+        finite_window_text = "finite window: n/a"
+        if cd.get("valid"):
+            ell_star = cd.get("ell_star")
+            if ell_star is not None and np.isfinite(float(ell_star)) and float(ell_star) > 0:
+                ell_star_f = float(ell_star)
+                x_star = np.log(ell_star_f)
+                wmask = ell_m <= ell_star_f
+                if int(np.count_nonzero(wmask)) >= 6:
+                    xw = log_ell_m[wmask]
+                    yw = log_mu_m[wmask]
+                    slope_w, intercept_w = np.polyfit(xw, yw, deg=1)
+                    pred_w = intercept_w + slope_w * xw
+                    ss_res_w = float(np.sum((yw - pred_w) ** 2))
+                    ss_tot_w = float(np.sum((yw - float(np.mean(yw))) ** 2))
+                    r2_w = 1.0 - ss_res_w / ss_tot_w if ss_tot_w > 0 else float("nan")
+                    beta_w = max(0.0, -float(slope_w))
+                    ax.axvspan(float(np.min(xw)), float(np.max(xw)),
+                               color="#aa3377", alpha=0.08, lw=0,
+                               label="finite-window fit range")
+                    ax.plot(xw, pred_w, color="#aa3377", linewidth=2.0,
+                            label=rf"finite-window power ($\beta={beta_w:.3f}$, $R^2={r2_w:.3f}$)")
+                    ax.axvline(x_star, color="#555555", linestyle=":", linewidth=1.0,
+                               label=rf"$\ell^*={ell_star_f:.1f}$")
+                    finite_window_text = (
+                        f"finite-window beta={beta_w:.3g}\n"
+                        f"finite-window R2={r2_w:.3g}\n"
+                        f"finite-window n={int(np.count_nonzero(wmask))}\n"
+                        f"ell*={ell_star_f:.3g}"
+                    )
+                else:
+                    finite_window_text = (
+                        f"finite-window n={int(np.count_nonzero(wmask))}\n"
+                        f"ell*={ell_star_f:.3g}"
+                    )
+
+        audit = env_audit.get(k)
+        corr_fit_text = "corr-gated fit: n/a"
+        if audit is not None:
+            corr = np.asarray(audit["corr_ratio"], dtype=float)
+            ell_a = np.asarray(audit["ell"], dtype=float)
+            log_a = np.asarray(audit["log_mu0"], dtype=float)
+            amask = (
+                _mask_log(ell_a, log_a)
+                & np.isfinite(corr)
+                & (corr <= float(args.corr_ratio_threshold))
+            )
+            if np.count_nonzero(amask) >= 6:
+                xg = np.log(ell_a[amask] + 1e-12)
+                yg = log_a[amask]
+                slope, intercept = np.polyfit(xg, yg, deg=1)
+                pred_g = intercept + slope * xg
+                ss_res = float(np.sum((yg - pred_g) ** 2))
+                ss_tot = float(np.sum((yg - float(np.mean(yg))) ** 2))
+                r2_g = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                beta_g = max(0.0, -float(slope))
+                ax.plot(xg, pred_g, color="#5b3f9f", linewidth=1.1, linestyle=":",
+                        label=rf"transport-controlled power ($\beta={beta_g:.3f}$, $R^2={r2_g:.3f}$)")
+                corr_fit_text = (
+                    f"transport-controlled beta={beta_g:.3g}\n"
+                    f"transport-controlled R2={r2_g:.3g}\n"
+                    f"transport-controlled n={int(np.count_nonzero(amask))}"
+                )
+            elif corr.size:
+                corr_fit_text = f"transport-controlled n={int(np.count_nonzero(amask))}"
+
+        def _fmt_optional(text: str) -> str:
+            # Compact the raw dict values for plot annotations.
+            for token in ("None", "nan"):
+                text = text.replace(token, "n/a")
+            return text
+
+        ann = (
+            f"{_fmt_optional(finite_window_text)}\n"
+            f"{_fmt_optional(corr_fit_text)}"
+        )
+        ax.text(0.02, 0.98, ann, transform=ax.transAxes, va="top", ha="left",
+                fontsize=7.2, family="monospace",
+                bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#999999", alpha=0.88))
+
+        ax.set_xlabel(r"$\log \ell$")
+        ax.set_ylabel(r"$\log \hat f(\ell)$")
+        ax.set_title(f"{k} envelope: finite-window power-law check")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=7, loc="lower left")
+        fig.tight_layout()
+        fig.savefig(
+            os.path.join(outdir, f"loglog_envelope_power_fit.png"),
+            dpi=args.dpi,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
 
     # ---- Plot 4: Fit R^2 bar + AIC winner annotation (if JSONs exist)
     names, exp_r2, pow_r2, temp_r2 = [], [], [], []

@@ -26,6 +26,9 @@ diagnostics/*_validation*/
 diagnostics/*_v[0-9]*/
 diagnostics/*_rerun*/
 diagnostics/output*/
+diagnostics/forcing_tail_estimator_validation.csv
+diagnostics/forcing_tail_estimator_validation.json
+diagnostics/forcing_tail_estimator_validation.md
 
 # LaTeX / Overleaf-managed paper sources
 latex/

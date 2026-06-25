@@ -119,7 +119,7 @@ def summarize_alpha_projections(
        reported alongside a sensitivity sweep at thresholds in
        ``TAILINESS_SWEEP`` (1.6, 1.7, 1.8, 1.9). The primary cut at 1.8
        sits a margin of 0.2 below the Gaussian boundary alpha=2; the
-       sweep documents that the directional verdict is not load-bearing
+       sweep documents that the directional summary is not load-bearing
        on the choice. The per-projection minimum is also reported but
        should be read as a sensitivity flag rather than as an aggregate.
     """
@@ -313,7 +313,7 @@ def summarize_alpha_projections(
         "final_alpha_mcc_boot_ci_hi_median": _quantile(final_mcc_ci_hi, 0.50),
         # Layer (iii): directional tailiness, simple per-direction
         # median. This is the directional-McCulloch summary that
-        # belongs in the manuscript table; it is the cross-seed median
+        # belongs in the compact results table; it is the cross-seed median
         # of the simple per-direction median computed in each row.
         "final_alpha_per_dir_median_median": _quantile(final_per_dir_median, 0.50),
         "final_alpha_per_dir_median_q25": _quantile(final_per_dir_median, 0.25),
@@ -323,7 +323,7 @@ def summarize_alpha_projections(
         "final_alpha_per_dir_frac_below_threshold_median": _quantile(final_per_dir_frac, 0.50),
         # Sensitivity sweep over the tailiness threshold. The primary cut
         # is the configured `tailiness_threshold` field above (default
-        # 1.8); the sweep here documents that the directional verdict is
+        # 1.8); the sweep here documents that the directional summary is
         # not load-bearing on the specific choice. Each entry is the
         # cross-seed median of the per-row fraction below the listed cut.
         "tailiness_threshold_sweep_values": list(TAILINESS_SWEEP),
@@ -461,6 +461,7 @@ def main():
         train_cmd = [
             sys.executable, MAIN_PHASE_TRAJECTORY,
             "--outdir", train_dir,
+            "--experiment_tag", "drift_validation",
             "--seeds", args.seeds,
             "--models", args.model,
             "--optimizer", args.optimizer,

@@ -4,27 +4,23 @@
 Experiment 1 is the structural negative control on the ConstGate architecture.
 It is run in two complementary phases that are paired by design:
 
-  - Path A (intervention)   : symmetric alpha-stable noise injected per-element
-                              into the parameter-gradient updates after gradient
-                              clipping. The forcing-side route ingredient is
-                              established by the injection mechanism itself.
+  - Path A (intervention)   : symmetric alpha-stable perturbation injected into
+                              the post-Adam update increments of slow-unit
+                              parameter rows. The achieved heaviness is read
+                              in the same update-space forcing coordinate used
+                              in Exp2.
   - Path B (spontaneous)    : same ConstGate trained under the matched protocol
                               with no intervention. The forcing proxy, drift
                               plateau, dynamic range, and envelope class are
                               read directly off the trajectory.
 
-This writer ingests the canonical aggregates that ``main_phase_trajectory.py`` produces
+This writer ingests the aggregate files that ``main_phase_trajectory.py`` produces
 for each path under
     <path>/<optimizer>/aggregated/<model>/
 and the drift-diagnostic output under
     <path>/<optimizer>/drift_<model>/
-and emits a single Markdown summary at ``results/exp1_results_summary.md``
-that the manuscript section can pull verbatim. Path A is described first
-throughout (matching the manuscript ordering convention).
-
-This is the consolidated replacement for the two legacy files
-``exp1_results_summary.md`` and ``exp1_inject_results_summary.md``. After
-running this writer once the legacy files can be deleted.
+and emits a single Markdown summary at ``results/exp1_results_summary.md``.
+Path A is described first throughout, matching the paper's presentation.
 
 Usage:
     # Defaults to results/exp1_constgate_full/adamw and
@@ -82,6 +78,27 @@ def _fmt(v: Any, digits: int = 3, missing: str = "—") -> str:
     if f != f or f in (float("inf"), float("-inf")):
         return missing
     return f"{f:.{digits}f}"
+
+
+def _fmt_p_value(value: Any, floor: Any = None, at_floor: Any = None, digits: int = 3) -> str:
+    """Format p-values, displaying Monte-Carlo floor hits as inequalities."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(p):
+        return "—"
+    try:
+        floor_v = float(floor)
+    except (TypeError, ValueError):
+        floor_v = float("nan")
+    try:
+        at_floor_v = float(at_floor)
+    except (TypeError, ValueError):
+        at_floor_v = 0.0
+    if math.isfinite(floor_v) and (at_floor_v >= 0.5 or p <= floor_v * (1.0 + 1e-12)):
+        return f"≤{floor_v:.{digits}f}"
+    return f"{p:.{digits}f}"
 
 
 def _fmt_int(v: Any, missing: str = "—") -> str:
@@ -156,11 +173,11 @@ def _load_final_tau_values(path_dir: Path, model: str) -> List[float]:
 # ``aggregated/<model>/`` and ``drift_<model>/``.
 # ============================================================
 def collect_path_record(path_dir: Path, model: str) -> Dict[str, Any]:
-    """Collect the headline numbers for one path (Path A or Path B)."""
+    """Collect the compact summary numbers for one path (Path A or Path B)."""
     agg_dir = path_dir / "aggregated" / model
     rec: Dict[str, Any] = {"path_dir": str(path_dir), "model": model}
 
-    # --- Final phase verdict (canonical Table-1 rule) -----------------
+    # --- Recorded phase labels and final envelope diagnostics ---------
     fp = _load_json(agg_dir / f"{model}_final_phase.json")
     rec["final_phase_present"] = fp is not None
     if fp is not None:
@@ -193,11 +210,22 @@ def collect_path_record(path_dir: Path, model: str) -> Dict[str, Any]:
     if last is not None:
         rec["final_epoch"] = last.get("epoch")
         rec["final_step"] = last.get("step")
-        rec["alpha_ecf_final"] = last.get("alpha_ecf_mean")
-        rec["alpha_ecf_se_final"] = last.get("alpha_ecf_se")
-        rec["alpha_mcculloch_final"] = last.get("alpha_mcculloch_mean")
-        rec["alpha_mcculloch_se_final"] = last.get("alpha_mcculloch_se")
-        rec["alpha_reliable_final"] = last.get("alpha_reliable_mean")
+        rec["forcing_alpha_final"] = last.get("forcing_alpha_hat_mean")
+        rec["forcing_alpha_se_final"] = last.get("forcing_alpha_hat_se")
+        rec["forcing_alpha_reliable_final"] = last.get("forcing_alpha_reliable_mean")
+        rec["forcing_gaussian_p_value_final"] = last.get("forcing_gaussian_p_value_mean")
+        rec["forcing_gaussian_p_value_lo_final"] = last.get("forcing_gaussian_p_value_lo_mean")
+        rec["forcing_gaussian_p_value_hi_final"] = last.get("forcing_gaussian_p_value_hi_mean")
+        rec["forcing_gaussian_p_value_floor_final"] = last.get("forcing_gaussian_p_value_floor_mean")
+        rec["forcing_gaussian_p_value_at_floor_final"] = last.get("forcing_gaussian_p_value_at_floor_mean")
+        rec["forcing_gaussian_reject_final"] = last.get("forcing_gaussian_reject_mean")
+        rec["forcing_detectably_heavy_final"] = last.get("forcing_alpha_detectably_heavy_mean")
+        rec["forcing_substantively_heavy_final"] = last.get("forcing_alpha_substantively_heavy_mean")
+        rec["forcing_resolvably_heavy_final"] = last.get("forcing_alpha_resolvably_heavy_mean")
+        rec["forcing_alpha_substantive_threshold_final"] = last.get("forcing_alpha_substantive_threshold_mean")
+        rec["forcing_alpha2_band_lo_final"] = last.get("forcing_alpha2_band_lo_mean")
+        rec["forcing_alpha2_band_hi_final"] = last.get("forcing_alpha2_band_hi_mean")
+        rec["forcing_heavy_fraction_final"] = last.get("forcing_heavy_fraction_mean")
         rec["beta_env_final"] = last.get("beta_env_mean")
         rec["beta_env_se_final"] = last.get("beta_env_se")
         rec["beta_env_r2_final"] = last.get("beta_env_r2_mean")
@@ -342,41 +370,18 @@ def _kappa_at_q010(rec: Dict[str, Any]) -> Tuple[Optional[float], Optional[float
     return best.get("kappa_tail"), best.get("lo"), best.get("hi")
 
 
-def _headline_verdict(path_a: Dict[str, Any], path_b: Dict[str, Any]) -> str:
-    """Generate the consolidated headline-verdict paragraph.
-
-    The verdict is keyed on the canonical full-trajectory phase label in
-    both paths. We do not attempt to second-guess the manuscript prose —
-    this paragraph is a starting point that the author can refine.
-    """
+def _overview_reading(path_a: Dict[str, Any], path_b: Dict[str, Any]) -> str:
+    """Generate a neutral audit overview for the markdown summary."""
     pa_label = path_a.get("majority_phase_label", "—")
     pb_label = path_b.get("majority_phase_label", "—")
     pa_counts = path_a.get("phase_counts", {})
     pb_counts = path_b.get("phase_counts", {})
-
-    pa_collapsed = (pa_label == "collapsed")
-    pb_collapsed = (pb_label == "collapsed")
-
-    if pa_collapsed and pb_collapsed:
-        return (
-            "**Headline verdict.** ConstGate fails the route under both paths. "
-            "In Path A the forcing channel is externally supplied by construction "
-            "(symmetric $\\alpha$-stable per-element noise on the parameter gradients), "
-            "yet the drift-side route condition still fails and the canonical "
-            "full-trajectory phase verdict is **collapsed** in every seed "
-            f"({pa_counts}). Path B confirms that the spontaneous run is also "
-            f"**collapsed** in every seed ({pb_counts}); the forcing proxy stays at "
-            "the near-Gaussian boundary, the far-left drift plateau is negative on every "
-            "quantile slice, and Path A narrows rather than broadens the final "
-            "time-scale spectrum relative to Path B. The drift-axis absence is therefore not explained by lack of "
-            "heavy-tailed forcing alone --- it is an architectural property of the "
-            "frozen-gate constraint."
-        )
     return (
-        f"**Headline verdict.** Path A majority phase: **{pa_label}** "
-        f"({pa_counts}). Path B majority phase: **{pb_label}** ({pb_counts}). "
-        "The route conditions are not jointly satisfied in either path; "
-        "see the headline-numbers tables below for the discriminating axes."
+        f"**Audit overview.** Path A recorded label: **{pa_label}** "
+        f"({pa_counts}). Path B recorded label: **{pb_label}** ({pb_counts}). "
+        "This file reports the slow-mode forcing readout, spectra, drift sweep, "
+        "and envelope fits for both paths; the manuscript interpretation should "
+        "be made from those measured observables."
     )
 
 
@@ -411,16 +416,18 @@ def render_markdown(
     )
     lines.append(
         "**Intervention (Path A only):** symmetric $\\alpha$-stable noise with "
-        "stability index $\\alpha = 1.6$ added per-element to all trainable parameter "
-        "gradients after `clip_grad_norm_`, with per-parameter dispersion calibrated "
-        "to the natural gradient root-mean-square. Path B trains with no intervention."
+        "the configured stability index added after the optimizer step to the "
+        "selected slow-unit rows of trainable parameter tensors. The dispersion "
+        "is calibrated to the RMS post-Adam increment on those rows, and the "
+        "standardized draw is bounded by a soft taper at the configured "
+        "injection bound. Path B trains with no intervention."
     )
     lines.append("")
-    lines.append(_headline_verdict(path_a, path_b))
+    lines.append(_overview_reading(path_a, path_b))
     lines.append("")
 
-    # --- Phase verdict table -----------------------------------------
-    lines.append("## Phase verdicts (canonical full-trajectory rule)")
+    # --- Recorded phase-label table ----------------------------------
+    lines.append("## Recorded phase labels")
     lines.append("")
     lines.append("| Path | n_seeds | majority phase | counts | envelope_winner | crossover_mode | power_law_window_pass |")
     lines.append("|------|--------:|----------------|--------|-----------------|----------------|-----------------------|")
@@ -439,26 +446,46 @@ def render_markdown(
     lines.append("")
 
     # --- Forcing-axis table -------------------------------------------
-    lines.append("## Forcing proxy α at convergence")
+    lines.append("## Slow-mode forcing tail at convergence")
     lines.append("")
     lines.append("| Diagnostic | Path A (with injection) | Path B (spontaneous) |")
     lines.append("|------------|-------------------------|----------------------|")
     lines.append(
-        f"| Pooled $\\hat\\alpha_{{\\mathrm{{ECF}}}}$ (final) | "
-        f"{_fmt(path_a.get('alpha_ecf_final'), 3)} ± {_fmt(path_a.get('alpha_ecf_se_final'), 3)} | "
-        f"{_fmt(path_b.get('alpha_ecf_final'), 3)} ± {_fmt(path_b.get('alpha_ecf_se_final'), 3)} |"
+        f"| Slow-mode calibrated $\\hat\\alpha_{{\\mathrm{{eff}}}}$ (final) | "
+        f"{_fmt(path_a.get('forcing_alpha_final'), 3)} ± {_fmt(path_a.get('forcing_alpha_se_final'), 3)} | "
+        f"{_fmt(path_b.get('forcing_alpha_final'), 3)} ± {_fmt(path_b.get('forcing_alpha_se_final'), 3)} |"
     )
     lines.append(
-        f"| Pooled $\\hat\\alpha_{{\\mathrm{{McC}}}}$ (final) | "
-        f"{_fmt(path_a.get('alpha_mcculloch_final'), 3)} ± {_fmt(path_a.get('alpha_mcculloch_se_final'), 3)} | "
-        f"{_fmt(path_b.get('alpha_mcculloch_final'), 3)} ± {_fmt(path_b.get('alpha_mcculloch_se_final'), 3)} |"
+        f"| $\\alpha=2$ calibration band | "
+        f"[{_fmt(path_a.get('forcing_alpha2_band_lo_final'), 3)}, {_fmt(path_a.get('forcing_alpha2_band_hi_final'), 3)}] | "
+        f"[{_fmt(path_b.get('forcing_alpha2_band_lo_final'), 3)}, {_fmt(path_b.get('forcing_alpha2_band_hi_final'), 3)}] |"
+    )
+    lines.append(
+        f"| Gaussian-boundary test $p$-value | "
+        f"{_fmt_p_value(path_a.get('forcing_gaussian_p_value_final'), path_a.get('forcing_gaussian_p_value_floor_final'), path_a.get('forcing_gaussian_p_value_at_floor_final'), 3)} "
+        f"[{_fmt(path_a.get('forcing_gaussian_p_value_lo_final'), 3)}, {_fmt(path_a.get('forcing_gaussian_p_value_hi_final'), 3)}] | "
+        f"{_fmt_p_value(path_b.get('forcing_gaussian_p_value_final'), path_b.get('forcing_gaussian_p_value_floor_final'), path_b.get('forcing_gaussian_p_value_at_floor_final'), 3)} "
+        f"[{_fmt(path_b.get('forcing_gaussian_p_value_lo_final'), 3)}, {_fmt(path_b.get('forcing_gaussian_p_value_hi_final'), 3)}] |"
+    )
+    lines.append(
+        f"| Reject Gaussian boundary test | "
+        f"{_fmt(path_a.get('forcing_detectably_heavy_final'), 2)} | "
+        f"{_fmt(path_b.get('forcing_detectably_heavy_final'), 2)} |"
+    )
+    threshold = path_a.get("forcing_alpha_substantive_threshold_final") or path_b.get("forcing_alpha_substantive_threshold_final")
+    lines.append(
+        f"| Substantively heavy fraction ($\\hat\\alpha_{{\\mathrm{{eff}},hi}}\\le {_fmt(threshold, 2)}$) | "
+        f"{_fmt(path_a.get('forcing_substantively_heavy_final'), 2)} | "
+        f"{_fmt(path_b.get('forcing_substantively_heavy_final'), 2)} |"
     )
     lines.append("")
     lines.append(
         "In Path A the forcing channel is supplied by the injected symmetric "
-        "$\\alpha$-stable gradient noise. Its presence is part of the experimental "
-        "setup; the load-bearing Path A measurements are the drift plateau, final "
-        "spectrum, and canonical phase verdict."
+        "$\\alpha$-stable perturbation in the slow-row update channel. The "
+        "table reports the achieved tail index in the same "
+        "coordinate used for the Exp2 forcing diagnostic; the load-bearing "
+        "Path A measurements remain the drift plateau, final spectrum, and "
+        "envelope."
     )
     lines.append("")
 
@@ -467,7 +494,7 @@ def render_markdown(
     kb_q10, kb_lo, kb_hi = _kappa_at_q010(path_b)
     lines.append("## Far-left drift plateau at primary $q_{\\mathrm{low}}=0.10$")
     lines.append("")
-    lines.append("| Path | $\\hat\\kappa_{\\mathrm{tail}}$ | 90% block-bootstrap CI | verdict |")
+    lines.append("| Path | $\\hat\\kappa_{\\mathrm{tail}}$ | 90% block-bootstrap CI | recorded label |")
     lines.append("|------|---:|---|---------|")
     lines.append(
         f"| Path A | {_fmt(ka_q10, 5)} | [{_fmt(ka_lo, 5)}, {_fmt(ka_hi, 5)}] | "
@@ -526,10 +553,9 @@ def render_markdown(
     lines.append(
         "The spectrum diagnostic is descriptive, not a Gaussian/log-normal fit. "
         "The far-right $\\tau$ tail contains rare large-time-scale outliers, "
-        "which are visible in $\\tau_{q99}$ and in the CCDF plot, but the canonical "
-        "phase rule still finds no resolved power-law window and both paths remain "
-        "collapsed. Externally supplied heavy-tailed forcing in Path A narrows the "
-        "main body of the spectrum rather than broadening it."
+        "which are visible in $\\tau_{q99}$ and in the CCDF plot. The recorded "
+        "phase label and the resolved-window diagnostics should be read together "
+        "with the drift and spectrum panels, not as a standalone regime decision."
     )
     lines.append("")
 
@@ -610,9 +636,10 @@ def render_markdown(
         "where the legacy envelope used to develop non-monotonicities."
     )
     lines.append(
-        "- Phase labels come from the canonical Table-1 rule applied to "
-        "`<model>_final_phase.json` at the end of training; the majority label "
-        "is reported as the headline phase for each path."
+        "- Phase labels are recorded by the diagnostic pipeline in "
+        "`<model>_final_phase.json` at the end of training. They are retained as "
+        "compact audit metadata; paper interpretation is made from the reported "
+        "spectra, drift estimates, forcing measurements, and envelopes."
     )
     lines.append(
         "- Drift $\\hat{\\kappa}_{\\mathrm{tail}}$ is reported at the primary "
@@ -621,9 +648,8 @@ def render_markdown(
         "block-bootstrap."
     )
     lines.append(
-        "- This file is regenerated by `write_exp1_summary.py`. Hand-edit only "
-        "after appending a `## Manual notes` section so subsequent regenerations "
-        "preserve the human commentary."
+        "- This file is regenerated by `write_exp1_summary.py`. Add durable "
+        "analysis below a `## Manual notes` heading if needed."
     )
 
     return "\n".join(lines) + "\n"

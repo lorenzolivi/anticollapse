@@ -2,33 +2,30 @@
 #
 # Main-text experiment launcher for the Anti-Collapse paper.
 #
-# The manuscript now has three empirical experiments:
-#   exp1: ConstGate structural negative control
-#   exp2: dynamical phase trajectory across the capacity ladder
-#   exp3: stochastic-forcing ablation
+# The manuscript has two empirical experiments:
+#   exp1: ConstGate structural negative control (Path B + Path A)
+#   exp2: SharedGate/DiagGate access-route test
 #
 # Usage:
 #   ./anticollapse.sh exp1 [smoke|full]
 #   ./anticollapse.sh exp2 [smoke|full]
-#   ./anticollapse.sh exp3 [smoke|full]
 #   ./anticollapse.sh all  [smoke|full]
 #
 # The optional profile defaults to "full".  The full profile is sequential
 # and DGX-Spark-safe in memory, but it is intentionally long-running.
-# Use EXP2_MODELS / EXP3_MODELS to split publication runs into smaller jobs.
+# Use EXP2_MODELS to split publication runs into smaller jobs.
 # Runs launch in the background by default, with .log and .pid files next to
 # the output directory. Set FOREGROUND=1 for an interactive foreground run.
 #
 # Output:
 #   results/exp1_constgate_<profile>/
 #   results/exp2_phase_<profile>/
-#   results/exp3_forcing_<profile>/
 #
 # Common environment overrides:
 #   RESULTS_DIR or OUTDIR, DEVICE, SEEDS, H, T, EPOCHS, CHECKPOINT_EVERY
 #   NSEQ_TRAIN, NSEQ_DIAG, TASK_ALPHA, TASK_K, TASK_LAG_MIN, TASK_LAG_MAX
 #   ALPHA_N_DIRECTIONS, ALPHA_N_GRAD_BATCHES, ALPHA_GRAD_BATCH_SIZE
-#   EXP2_MODELS, EXP3_MODELS, SKIP_PLOT, FOREGROUND
+#   EXP2_MODELS, SKIP_PLOT, FOREGROUND
 
 set -euo pipefail
 
@@ -45,11 +42,10 @@ usage() {
 anticollapse.sh - main-text Anti-Collapse experiment launcher
 
 Usage:
-    ./anticollapse.sh exp1        [smoke|full]   ConstGate structural negative control
-    ./anticollapse.sh exp1_inject [smoke|full]   Path A: ConstGate + α-stable forcing injection
-    ./anticollapse.sh exp2        [smoke|full]   phase trajectory / capacity ladder
-    ./anticollapse.sh exp3        [smoke|full]   stochastic-forcing ablation
-    ./anticollapse.sh all         [smoke|full]   run exp1, exp2, exp3 sequentially
+    ./anticollapse.sh exp1        [smoke|full]   ConstGate negative control, both paths
+    ./anticollapse.sh exp1_inject [smoke|full]   Path A only: ConstGate + slow-mode forcing
+    ./anticollapse.sh exp2        [smoke|full]   SharedGate/DiagGate access-route test
+    ./anticollapse.sh all         [smoke|full]   run exp1 and exp2 sequentially
     ./anticollapse.sh --help                     show this help
 
 Examples:
@@ -57,12 +53,11 @@ Examples:
     ./anticollapse.sh exp1_inject smoke
     INJECT_ALPHA=1.4 INJECT_ALPHA_NOISE=2.0 ./anticollapse.sh exp1_inject full
     ./anticollapse.sh exp2 full
-    EXP2_MODELS=diag,gru ./anticollapse.sh exp2 full
-    EXP3_MODELS=diag EXP3_CONDITIONS=baseline,clip_ablation ./anticollapse.sh exp3 full
+    EXP2_MODELS=diag ./anticollapse.sh exp2 full
 
 Profiles:
     smoke: 1 seed, small model/task, pipeline integrity only.
-    full:  5 seeds, H=512, stressed heavy-tailed-lag task, publication scale.
+    full:  10 seeds, H=512, stressed heavy-tailed-lag task, publication scale.
 
 Outputs default to results/ under the project root. Set RESULTS_DIR or OUTDIR
 to redirect all experiment folders.
@@ -75,7 +70,7 @@ EOF
 }
 
 case "$COMMAND" in
-    exp1|exp1_inject|exp2|exp3|all|--help|-h|help|"") ;;
+    exp1|exp1_inject|exp2|all|--help|-h|help|"") ;;
     *)
         echo "Error: unknown command '$COMMAND'." >&2
         usage
@@ -104,20 +99,16 @@ case "$PROFILE" in
         ALPHA_N_GRAD_BATCHES="${ALPHA_N_GRAD_BATCHES:-64}"
         ALPHA_GRAD_BATCH_SIZE="${ALPHA_GRAD_BATCH_SIZE:-128}"
         BETA_BOOTSTRAP_B="${BETA_BOOTSTRAP_B:-500}"
-        EXP2_MODELS="${EXP2_MODELS:-shared,diag,gru}"
-        EXP3_MODELS="${EXP3_MODELS:-diag}"
-        EXP3_BATCH_VALUES="${EXP3_BATCH_VALUES:-1024}"
-        EXP3_CLIP_VALUES="${EXP3_CLIP_VALUES:-0.1}"
-        EXP3_WINSOR_VALUES="${EXP3_WINSOR_VALUES:-95}"
-        WARMUP_EPOCHS="${WARMUP_EPOCHS:-40}"
+        EXP2_MODELS="${EXP2_MODELS:-shared,diag}"
+        FORCING_TAIL_BOOTSTRAP_B="${FORCING_TAIL_BOOTSTRAP_B:-20}"
         ;;
     full)
-        SEEDS="${SEEDS:-47,83,12,69,31}"
+        SEEDS="${SEEDS:-47,83,12,69,31,104,218,337,451,592}"
         H="${H:-512}"
         T="${T:-1280}"
         D="${D:-16}"
         EPOCHS="${EPOCHS:-1400}"
-        CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-20}"
+        CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-40}"
         NSEQ_TRAIN="${NSEQ_TRAIN:-8000}"
         NSEQ_DIAG="${NSEQ_DIAG:-6000}"
         TASK_ALPHA="${TASK_ALPHA:-0.6}"
@@ -128,12 +119,8 @@ case "$PROFILE" in
         ALPHA_N_GRAD_BATCHES="${ALPHA_N_GRAD_BATCHES:-128}"
         ALPHA_GRAD_BATCH_SIZE="${ALPHA_GRAD_BATCH_SIZE:-256}"
         BETA_BOOTSTRAP_B="${BETA_BOOTSTRAP_B:-2000}"
-        EXP2_MODELS="${EXP2_MODELS:-shared,diag,gru,lstm}"
-        EXP3_MODELS="${EXP3_MODELS:-diag}"
-        EXP3_BATCH_VALUES="${EXP3_BATCH_VALUES:-2048,4096,8192}"
-        EXP3_CLIP_VALUES="${EXP3_CLIP_VALUES:-0.1,0.01,0.001}"
-        EXP3_WINSOR_VALUES="${EXP3_WINSOR_VALUES:-95,90,80}"
-        WARMUP_EPOCHS="${WARMUP_EPOCHS:-200}"
+        EXP2_MODELS="${EXP2_MODELS:-shared,diag}"
+        FORCING_TAIL_BOOTSTRAP_B="${FORCING_TAIL_BOOTSTRAP_B:-300}"
         ;;
     *)
         echo "Error: profile must be smoke or full, got '$PROFILE'." >&2
@@ -142,7 +129,7 @@ case "$PROFILE" in
 esac
 
 OPTIMIZER="${OPTIMIZER:-adamw}"
-BATCH_SIZE="${BATCH_SIZE:-512}"
+BATCH_SIZE="${BATCH_SIZE:-380}"
 DIAG_BATCH_SIZE="${DIAG_BATCH_SIZE:-256}"
 LR="${LR:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
@@ -164,20 +151,31 @@ POWER_WINDOW_MIN_FRACTION="${POWER_WINDOW_MIN_FRACTION:-0.05}"
 TASK_COEFF_BASE="${TASK_COEFF_BASE:-0.6}"
 TASK_COEFF_DECAY="${TASK_COEFF_DECAY:-0.85}"
 TASK_LAG_SEED="${TASK_LAG_SEED:-20260410}"
-EXP3_CONDITIONS="${EXP3_CONDITIONS:-baseline,batch_ablation,clip_ablation,winsorize_ablation}"
 SAVE_MODEL_CHECKPOINTS="${SAVE_MODEL_CHECKPOINTS:-0}"
 SKIP_PLOT="${SKIP_PLOT:-1}"
+SLOW_MODE_Q_LOW="${SLOW_MODE_Q_LOW:-0.10}"
+FORCING_TAIL_MAX_SAMPLES="${FORCING_TAIL_MAX_SAMPLES:-20000}"
+FORCING_TAIL_K_MIN="${FORCING_TAIL_K_MIN:-50}"
+FORCING_TAIL_K_FRAC="${FORCING_TAIL_K_FRAC:-0.08}"
+FORCING_TAIL_CI_B="${FORCING_TAIL_CI_B:-100}"
+FORCING_TAIL_K_MAX_FRAC="${FORCING_TAIL_K_MAX_FRAC:-0.20}"
+FORCING_TAIL_SUBSTANTIVE_ALPHA="${FORCING_TAIL_SUBSTANTIVE_ALPHA:-1.8}"
+FORCING_TAIL_GAUSSIAN_TEST_ALPHA="${FORCING_TAIL_GAUSSIAN_TEST_ALPHA:-0.05}"
 
 EXP1_OUTDIR="${EXP1_OUTDIR:-$RESULTS_DIR/exp1_constgate_${PROFILE}}"
 EXP1_INJECT_OUTDIR="${EXP1_INJECT_OUTDIR:-$RESULTS_DIR/exp1_constgate_inject_${PROFILE}}"
 EXP2_OUTDIR="${EXP2_OUTDIR:-$RESULTS_DIR/exp2_phase_${PROFILE}}"
-EXP3_OUTDIR="${EXP3_OUTDIR:-$RESULTS_DIR/exp3_forcing_${PROFILE}}"
 ALL_RUN_STEM="${ALL_RUN_STEM:-$RESULTS_DIR/anticollapse_all_${PROFILE}}"
 
-# Heavy-tailed gradient-noise injection (Path A) settings. Used only when
-# COMMAND == exp1_inject. INJECT_ALPHA_NOISE=0 disables (no-op); >0 enables.
+# Slow-mode update-space injection (Path A) settings. Used only for
+# exp1_inject or the Path A half of exp1. INJECT_ALPHA_NOISE=0 disables.
+# INJECT_NOISE_CLIP bounds the standardized alpha-stable draw. In update mode
+# the bound is a soft tanh taper, so the post-Adam update driver keeps a heavy
+# operative tail without hard-clipping pile-up.
+INJECT_MODE="${INJECT_MODE:-update}"
 INJECT_ALPHA_NOISE="${INJECT_ALPHA_NOISE:-1.0}"
-INJECT_ALPHA="${INJECT_ALPHA:-1.6}"
+INJECT_ALPHA="${INJECT_ALPHA:-1.5}"
+INJECT_NOISE_CLIP="${INJECT_NOISE_CLIP:-100.0}"
 INJECT_GRAD_SEED_OFFSET="${INJECT_GRAD_SEED_OFFSET:-1729}"
 
 mkdir -p "$RESULTS_DIR"
@@ -209,6 +207,15 @@ common_exp_args=(
     --alpha_n_grad_batches_ckpt "$ALPHA_N_GRAD_BATCHES"
     --alpha_grad_batch_size "$ALPHA_GRAD_BATCH_SIZE"
     --alpha_n_directions "$ALPHA_N_DIRECTIONS"
+    --slow_mode_q_low "$SLOW_MODE_Q_LOW"
+    --forcing_tail_max_samples "$FORCING_TAIL_MAX_SAMPLES"
+    --forcing_tail_bootstrap_B "$FORCING_TAIL_BOOTSTRAP_B"
+    --forcing_tail_ci_B "$FORCING_TAIL_CI_B"
+    --forcing_tail_k_min "$FORCING_TAIL_K_MIN"
+    --forcing_tail_k_frac "$FORCING_TAIL_K_FRAC"
+    --forcing_tail_k_max_frac "$FORCING_TAIL_K_MAX_FRAC"
+    --forcing_tail_substantive_alpha "$FORCING_TAIL_SUBSTANTIVE_ALPHA"
+    --forcing_tail_gaussian_test_alpha "$FORCING_TAIL_GAUSSIAN_TEST_ALPHA"
     --tau_fit_lag_min "$TAU_FIT_LAG_MIN"
     --tau_fit_lag_max "$TAU_FIT_LAG_MAX"
     --tau_fit_num_lags "$TAU_FIT_NUM_LAGS"
@@ -244,10 +251,10 @@ is_true() {
 launcher_artifacts() {
     case "$COMMAND" in
         exp1)
-            RUN_LABEL="Experiment 1: ConstGate structural negative control"
+            RUN_LABEL="Experiment 1: ConstGate structural negative control (both paths)"
             RUN_LOGFILE="${EXP1_OUTDIR}.log"
             RUN_PIDFILE="${EXP1_OUTDIR}.pid"
-            TARGET_DIRS=("$EXP1_OUTDIR")
+            TARGET_DIRS=("$EXP1_OUTDIR" "$EXP1_INJECT_OUTDIR")
             ;;
         exp1_inject)
             RUN_LABEL="Experiment 1 (Path A): ConstGate with α-stable forcing injection"
@@ -256,22 +263,16 @@ launcher_artifacts() {
             TARGET_DIRS=("$EXP1_INJECT_OUTDIR")
             ;;
         exp2)
-            RUN_LABEL="Experiment 2: dynamical phase trajectory"
+            RUN_LABEL="Experiment 2: SharedGate/DiagGate access-route test"
             RUN_LOGFILE="${EXP2_OUTDIR}.log"
             RUN_PIDFILE="${EXP2_OUTDIR}.pid"
             TARGET_DIRS=("$EXP2_OUTDIR")
             ;;
-        exp3)
-            RUN_LABEL="Experiment 3: stochastic-forcing ablation"
-            RUN_LOGFILE="${EXP3_OUTDIR}.log"
-            RUN_PIDFILE="${EXP3_OUTDIR}.pid"
-            TARGET_DIRS=("$EXP3_OUTDIR")
-            ;;
         all)
-            RUN_LABEL="Experiments 1-3: complete empirical campaign"
+            RUN_LABEL="Experiments 1-2: complete empirical campaign"
             RUN_LOGFILE="${ALL_RUN_STEM}.log"
             RUN_PIDFILE="${ALL_RUN_STEM}.pid"
-            TARGET_DIRS=("$EXP1_OUTDIR" "$EXP2_OUTDIR" "$EXP3_OUTDIR")
+            TARGET_DIRS=("$EXP1_OUTDIR" "$EXP1_INJECT_OUTDIR" "$EXP2_OUTDIR")
             ;;
     esac
 }
@@ -311,37 +312,47 @@ if [[ "${ANTICOLLAPSE_INTERNAL_RUN:-0}" != "1" ]] && ! is_true "${FOREGROUND:-0}
     exit 0
 fi
 
-run_exp1() {
+run_exp1_baseline() {
     echo "============================================================"
-    echo "Experiment 1: ConstGate structural negative control"
+    echo "Experiment 1 Path B: ConstGate spontaneous baseline"
     echo "============================================================"
     echo "outdir: $EXP1_OUTDIR"
     run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP1_OUTDIR" \
+        --experiment_tag exp1 \
         --models const \
         "${common_exp_args[@]}"
 }
 
 run_exp1_inject() {
     echo "============================================================"
-    echo "Experiment 1 (Path A): ConstGate with α-stable forcing injection"
+    echo "Experiment 1 Path A: ConstGate with slow-mode α-stable forcing"
     echo "============================================================"
     echo "outdir:               $EXP1_INJECT_OUTDIR"
+    echo "inject_mode:          $INJECT_MODE"
     echo "inject_alpha_noise:   $INJECT_ALPHA_NOISE"
     echo "inject_alpha:         $INJECT_ALPHA"
     echo "inject_grad_seed_off: $INJECT_GRAD_SEED_OFFSET"
     run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP1_INJECT_OUTDIR" \
+        --experiment_tag exp1 \
         --models const \
+        --inject_mode "$INJECT_MODE" \
         --inject_alpha_noise "$INJECT_ALPHA_NOISE" \
         --inject_alpha "$INJECT_ALPHA" \
+        --inject_noise_clip "$INJECT_NOISE_CLIP" \
         --inject_grad_seed_offset "$INJECT_GRAD_SEED_OFFSET" \
         "${common_exp_args[@]}"
 }
 
+run_exp1() {
+    run_exp1_baseline
+    run_exp1_inject
+}
+
 run_exp2() {
     echo "============================================================"
-    echo "Experiment 2: dynamical phase trajectory"
+    echo "Experiment 2: SharedGate/DiagGate access-route test"
     echo "============================================================"
     echo "models: $EXP2_MODELS"
     echo "outdir: $EXP2_OUTDIR"
@@ -351,26 +362,9 @@ run_exp2() {
     fi
     run_python "$SCRIPT_DIR/main_phase_trajectory.py" \
         --outdir "$EXP2_OUTDIR" \
+        --experiment_tag exp2 \
         --models "$EXP2_MODELS" \
         "${exp2_args[@]}"
-}
-
-run_exp3() {
-    echo "============================================================"
-    echo "Experiment 3: stochastic-forcing ablation"
-    echo "============================================================"
-    echo "models: $EXP3_MODELS"
-    echo "conditions: $EXP3_CONDITIONS"
-    echo "outdir: $EXP3_OUTDIR"
-    run_python "$SCRIPT_DIR/main_forcing_ablation.py" \
-        --outdir "$EXP3_OUTDIR" \
-        --models "$EXP3_MODELS" \
-        --conditions "$EXP3_CONDITIONS" \
-        --batch_ablation_values "$EXP3_BATCH_VALUES" \
-        --clip_ablation_values "$EXP3_CLIP_VALUES" \
-        --winsorize_ablation_values "$EXP3_WINSOR_VALUES" \
-        --warmup_epochs "$WARMUP_EPOCHS" \
-        "${common_exp_args[@]}"
 }
 
 ACTIVE_CHILD=""
@@ -385,7 +379,7 @@ terminate_active_child() {
 trap terminate_active_child TERM INT
 
 run_python() {
-    if [[ "$COMMAND" == "all" ]]; then
+    if [[ "$COMMAND" == "all" || "$COMMAND" == "exp1" ]]; then
         python "$@" &
         ACTIVE_CHILD=$!
         set +e
@@ -416,12 +410,8 @@ case "$COMMAND" in
     exp2)
         run_exp2
         ;;
-    exp3)
-        run_exp3
-        ;;
     all)
         run_exp1
         run_exp2
-        run_exp3
         ;;
 esac

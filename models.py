@@ -26,6 +26,7 @@ Notation follows the companion papers:
 import numpy as np
 import torch
 import torch.nn as nn
+import math
 
 
 # ============================================================
@@ -36,6 +37,89 @@ def layernorm_if(enabled: bool, dim: int):
     return nn.LayerNorm(dim) if enabled else nn.Identity()
 
 
+def _stable_sample_symmetric(
+    alpha: float,
+    scale: float,
+    shape,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    clip: float = 0.0,
+) -> torch.Tensor:
+    """Draw symmetric alpha-stable noise with CMS sampling.
+
+    When ``clip > 0`` the standardized draw is truncated to ``[-clip, clip]``
+    (in dispersion units) before scaling. A symmetric alpha-stable law with
+    alpha < 2 has infinite variance and produces rare, arbitrarily large
+    excursions; injected into the recurrent state these overflow it to
+    NaN/Inf. Truncating bounds those catastrophic draws while preserving the
+    heavy tail over the operative range, which is also consistent with the
+    tempered/truncated-jump interpretation used by the generator model.
+    """
+    if scale <= 0.0:
+        return torch.zeros(shape, device=device, dtype=dtype)
+    eps = 1e-37
+    U = (torch.rand(shape, generator=generator, device=device, dtype=dtype) - 0.5) * math.pi
+    W = -torch.log(torch.rand(shape, generator=generator, device=device, dtype=dtype).clamp_min(eps))
+    if abs(float(alpha) - 1.0) < 1e-6:
+        X = torch.tan(U)
+    else:
+        sin_aU = torch.sin(float(alpha) * U)
+        cos_U = torch.cos(U).clamp_min(eps)
+        cos_au = torch.cos((float(alpha) - 1.0) * U).clamp_min(eps)
+        X = (sin_aU / cos_U.pow(1.0 / float(alpha))) * (cos_au / W).pow((1.0 - float(alpha)) / float(alpha))
+    if float(clip) > 0.0:
+        X = X.clamp(-float(clip), float(clip))
+    return X.mul_(float(scale))
+
+
+def _apply_state_increment_injection(
+    h: torch.Tensor,
+    h_prev: torch.Tensor,
+    state_injection: dict | None,
+) -> torch.Tensor:
+    """Perturb selected hidden-state increment coordinates in-place logically.
+
+    The injection is applied after the deterministic recurrent update.  Its
+    dispersion is calibrated to the RMS increment on the selected coordinates,
+    so the same operator can be used across ConstGate, SharedGate, and DiagGate.
+    """
+    if not state_injection:
+        return h
+    scale_multiplier = float(state_injection.get("scale_multiplier", 0.0))
+    if scale_multiplier <= 0.0:
+        return h
+    generator = state_injection.get("generator")
+    if generator is None:
+        return h
+    mask = state_injection.get("mask")
+    if mask is None:
+        return h
+    if not torch.is_tensor(mask):
+        mask = torch.as_tensor(mask, device=h.device)
+    mask = mask.to(device=h.device, dtype=torch.bool)
+    if mask.numel() != h.shape[-1] or not bool(mask.any()):
+        return h
+
+    delta = (h - h_prev)[:, mask]
+    rms = torch.linalg.vector_norm(delta.detach()).item() / max(math.sqrt(delta.numel()), 1e-37)
+    scale = scale_multiplier * float(rms)
+    if scale <= 0.0:
+        return h
+    noise = _stable_sample_symmetric(
+        alpha=float(state_injection.get("alpha", 1.6)),
+        scale=scale,
+        shape=delta.shape,
+        device=h.device,
+        dtype=h.dtype,
+        generator=generator,
+        clip=float(state_injection.get("noise_clip", 0.0)),
+    )
+    h = h.clone()
+    h[:, mask] = h[:, mask] + noise
+    return h
+
+
 # ============================================================
 # Base class
 # ============================================================
@@ -44,9 +128,11 @@ class BaseRNN(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x: torch.Tensor, gate_rescale=None, return_intermediates=True):
+    def forward(self, x: torch.Tensor, gate_rescale=None, return_intermediates=True,
+                state_injection=None):
         return self.forward_with_intermediates(
-            x, gate_rescale=gate_rescale, return_intermediates=return_intermediates
+            x, gate_rescale=gate_rescale, return_intermediates=return_intermediates,
+            state_injection=state_injection,
         )
 
     def apply_orthogonal(self):
@@ -82,7 +168,7 @@ class ConstGateRNN(BaseRNN):
         nn.init.zeros_(self.out.bias)
 
     def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None,
-                                    return_intermediates=True):
+                                    return_intermediates=True, state_injection=None):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
 
@@ -101,6 +187,7 @@ class ConstGateRNN(BaseRNN):
             pre = self.ln(pre)
             h_tilde = torch.tanh(pre)
             h = (1 - s) * h_prev + s * h_tilde
+            h = _apply_state_increment_injection(h, h_prev, state_injection)
             y = self.out(h)
             ys.append(y)
 
@@ -156,7 +243,7 @@ class SharedGateRNN(BaseRNN):
         nn.init.constant_(self.Ws.bias, gate_bias)
 
     def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None,
-                                    return_intermediates=True):
+                                    return_intermediates=True, state_injection=None):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
 
@@ -179,6 +266,7 @@ class SharedGateRNN(BaseRNN):
 
             sH = s.expand(B, self.H)
             h = (1 - sH) * h_prev + sH * h_tilde
+            h = _apply_state_increment_injection(h, h_prev, state_injection)
             y = self.out(h)
             ys.append(y)
 
@@ -236,7 +324,7 @@ class DiagGateRNN(BaseRNN):
         nn.init.constant_(self.Ws.bias, gate_bias)
 
     def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None,
-                                    return_intermediates=True):
+                                    return_intermediates=True, state_injection=None):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
 
@@ -258,6 +346,7 @@ class DiagGateRNN(BaseRNN):
             h_tilde = torch.tanh(pre)
 
             h = (1 - s) * h_prev + s * h_tilde
+            h = _apply_state_increment_injection(h, h_prev, state_injection)
             y = self.out(h)
             ys.append(y)
 
@@ -310,7 +399,7 @@ class GRUCustom(BaseRNN):
                 nn.init.zeros_(m.bias)
 
     def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None,
-                                    return_intermediates=True):
+                                    return_intermediates=True, state_injection=None):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
 
@@ -336,6 +425,7 @@ class GRUCustom(BaseRNN):
             g = torch.tanh(ag)
 
             h = (1.0 - z) * h_prev + z * g
+            h = _apply_state_increment_injection(h, h_prev, state_injection)
             y = self.out(h)
             ys.append(y)
 
@@ -401,7 +491,7 @@ class LSTMCustom(BaseRNN):
                 nn.init.zeros_(m.bias)
 
     def forward_with_intermediates(self, x: torch.Tensor, gate_rescale=None,
-                                    return_intermediates=True):
+                                    return_intermediates=True, state_injection=None):
         B, T, _ = x.shape
         h = torch.zeros(B, self.H, device=x.device)
         c = torch.zeros(B, self.H, device=x.device)
@@ -434,6 +524,7 @@ class LSTMCustom(BaseRNN):
             c = f * c_prev + i * g
             tanh_c = torch.tanh(c)
             h = o * tanh_c
+            h = _apply_state_increment_injection(h, h_prev, state_injection)
             y = self.out(h)
             ys.append(y)
 

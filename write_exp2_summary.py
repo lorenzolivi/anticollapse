@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 """Write results/exp2_phase_<profile>_results_summary.md.
 
-This is the exp2 counterpart of the ``results/exp1_results_summary.md`` and
-``results/exp1_inject_results_summary.md`` artifacts. It consumes the per-
-architecture aggregates that ``main_phase_trajectory.py`` writes for Experiment 2 (the
-capacity-ladder phase-trajectory experiment) and emits a markdown summary
-that the LaTeX section can pull verbatim.
+This is the exp2 counterpart of ``results/exp1_results_summary.md``. It
+consumes the per-architecture aggregates that ``main_phase_trajectory.py``
+writes for
+Experiment 2 (SharedGate collapsed reference vs DiagGate route candidate) and emits a
+markdown summary for audit and manuscript drafting.
 
 Per architecture we report:
-  - phase verdict counts (collapsed / canonical AC / robust AC),
-  - majority phase label and the canonical full-trajectory verdict,
+  - recorded phase-label counts (collapsed / canonical AC / robust AC),
+  - majority phase label from the full-trajectory diagnostic,
   - envelope exponent β̂_env (mean ± SE across seeds) at the final epoch,
   - envelope tail β̂ and bootstrap percentile interval from <arch>_final_phase.json,
   - final time-scale spectrum quantiles in both ζ = -log τ and τ,
     with Δζ = ζ_q90 − ζ_q10 retained as a scalar width summary,
   - far-left drift plateau κ_tail at the primary q_low (0.10) with 90% CI,
   - per-seed threshold-crossing epoch t_cross (observed vs right-censored),
-  - alpha_ECF at the final epoch as the spontaneous forcing proxy.
+  - update-space slow-mode forcing tail index at the final epoch,
+  - drift-subtracted ζ-residual tail diagnostics in the far-left slice,
+  - first-order-corrected envelope power-fit diagnostics.
 
-The headline-verdict paragraph is generated heuristically from the per-
-architecture results: we walk the capacity ladder in order and identify the
-first rung at which a sustained anti-collapsed verdict is reached. The
-generated paragraph is meant as a starting point for hand-editing into the
-manuscript; the script writes the raw numbers underneath so the prose can be
-cross-checked.
+The generated overview is intentionally lightweight: it summarizes the
+recorded labels and raw measurements, but the manuscript interpretation is
+made after inspecting the spectra, envelopes, drift estimates, and forcing
+measurements.
 
 Usage:
     python write_exp2_summary.py
     python write_exp2_summary.py \\
         --exp2_dir results/exp2_phase_full/adamw \\
-        --architectures shared,diag,gru,lstm \\
+        --architectures shared,diag \\
         --output results/exp2_phase_full_results_summary.md
 """
 
@@ -39,7 +39,6 @@ import argparse
 import csv
 import json
 import math
-import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -47,11 +46,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 ARCH_LABEL: Dict[str, str] = {
     "diag":   "DiagGate",
     "shared": "SharedGate",
-    "gru":    "GRU",
-    "lstm":   "LSTM",
 }
 
-# Phase-verdict short labels and ordering.
+# Phase-label short names and ordering.
 PHASE_ORDER: List[str] = [
     "collapsed",
     "concentrated anti-collapse",
@@ -62,6 +59,11 @@ PHASE_SHORT: Dict[str, str] = {
     "concentrated anti-collapse":  "canonical AC",
     "anti-collapse":               "robust AC",
 }
+
+_DEFAULT_SEQ_LEN = 1280
+_SEQ_LEN_KEYS = ("T", "seq_len", "seq_length", "context_length",
+                 "T_train", "train_seq_len")
+_TAU_CAP_MODES = ("raw", "seq_len", "fit_lag_max")
 
 
 # ----- IO helpers -----
@@ -93,12 +95,45 @@ def _fmt(v: Optional[float], digits: int = 3) -> str:
         return "—"
 
 
+def _fmt_p_value(value: Optional[float], floor: Optional[float] = None,
+                 at_floor: Optional[float] = None, digits: int = 3) -> str:
+    """Format p-values, displaying Monte-Carlo floor hits as inequalities."""
+    try:
+        p = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(p):
+        return "—"
+    try:
+        floor_v = float(floor)
+    except (TypeError, ValueError):
+        floor_v = float("nan")
+    try:
+        at_floor_v = float(at_floor)
+    except (TypeError, ValueError):
+        at_floor_v = 0.0
+    if math.isfinite(floor_v) and (at_floor_v >= 0.5 or p <= floor_v * (1.0 + 1e-12)):
+        return f"≤{floor_v:.{digits}f}"
+    return f"{p:.{digits}f}"
+
+
 def _fmt_int(v: Optional[float]) -> str:
     """Format a numeric count or ``-`` for missing values."""
     try:
         return str(int(float(v)))
     except (TypeError, ValueError):
         return "—"
+
+
+def _safe_float(v: object) -> Optional[float]:
+    """Return a finite float, or None for missing/non-finite values."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
 
 
 def _quantile(xs: List[float], q: float) -> Optional[float]:
@@ -125,14 +160,95 @@ def _checkpoint_epoch(p: Path) -> int:
         return -1
 
 
-def _load_final_tau_values(exp2_dir: Path, arch: str) -> List[float]:
+def _seed_seq_length(seed_dir: Path, default: int = _DEFAULT_SEQ_LEN) -> int:
+    """Read the sequence length T from a seed's CLI manifest."""
+    cli = seed_dir / "cli_args.json"
+    if not cli.exists():
+        return int(default)
+    try:
+        with open(cli) as f:
+            args = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return int(default)
+    for key in _SEQ_LEN_KEYS:
+        if key in args:
+            try:
+                return int(args[key])
+            except (TypeError, ValueError):
+                continue
+    return int(default)
+
+
+def _read_lag_grid_max(seed_dir: Path) -> Optional[int]:
+    """Read max(tau_fit_lags) from the seed-level lag grid, if present."""
+    lag_grid = seed_dir / "lag_grid.json"
+    if not lag_grid.exists():
+        return None
+    try:
+        with open(lag_grid) as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    for key in ("tau_fit_lags", "fit_lags"):
+        vals = d.get(key)
+        if isinstance(vals, list) and vals:
+            try:
+                return int(max(int(v) for v in vals))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _read_tau_info_fit_lag_max(tau_csv: Path) -> Optional[int]:
+    """Read max(fit_lags) from the final tau-slope fit metadata."""
+    info = tau_csv.with_name(tau_csv.name.replace("_taus.csv", "_tau_slope_fit_info.json"))
+    if not info.exists():
+        return None
+    try:
+        with open(info) as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    vals = d.get("fit_lags")
+    if isinstance(vals, list) and vals:
+        try:
+            return int(max(int(v) for v in vals))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _tau_cap(seed_dir: Path, tau_csv: Path, mode: str) -> Tuple[float, str]:
+    """Return the finite-resolution tau cap used for summary quantiles."""
+    if mode == "raw":
+        return float("inf"), "raw"
+    T = _seed_seq_length(seed_dir)
+    if mode == "fit_lag_max":
+        fit_lag_max = _read_lag_grid_max(seed_dir) or _read_tau_info_fit_lag_max(tau_csv)
+        if fit_lag_max is None:
+            fit_lag_max = max(1, int(T / 2))
+            source = f"fallback T/2={fit_lag_max}"
+        else:
+            source = f"max(tau_fit_lags)={fit_lag_max}"
+        return float(fit_lag_max), source
+    return float(T), f"T={T}"
+
+
+def _load_final_tau_values(exp2_dir: Path, arch: str, tau_cap_mode: str = "seq_len") -> List[float]:
     """Load finite positive τ values from each seed's final checkpoint CSV."""
+    if tau_cap_mode not in _TAU_CAP_MODES:
+        raise ValueError(f"Unknown tau_cap_mode={tau_cap_mode!r}")
     vals: List[float] = []
+    n_total = 0
+    n_dropped = 0
+    cap_sources: List[str] = []
     for seed_dir in sorted(exp2_dir.glob("seed_*")):
         tau_dir = seed_dir / arch / "checkpoint_taus"
         candidates = sorted(tau_dir.glob("ckpt_*_taus.csv"), key=_checkpoint_epoch)
         if not candidates:
             continue
+        cap, source = _tau_cap(seed_dir, candidates[-1], tau_cap_mode)
+        cap_sources.append(source)
         with open(candidates[-1]) as f:
             for row in csv.DictReader(f):
                 try:
@@ -140,19 +256,123 @@ def _load_final_tau_values(exp2_dir: Path, arch: str) -> List[float]:
                 except (KeyError, TypeError, ValueError):
                     continue
                 if math.isfinite(tau) and tau > 0.0:
+                    n_total += 1
+                    if tau > cap:
+                        n_dropped += 1
+                        continue
                     vals.append(tau)
+    if n_total > 0 and n_dropped > 0:
+        pct = 100.0 * n_dropped / n_total
+        source_text = ", ".join(sorted(set(cap_sources)))
+        print(f"    [tau filter] {exp2_dir}/{arch}: dropped {n_dropped}/"
+              f"{n_total} ({pct:.2f}%) tau values exceeding {tau_cap_mode} "
+              f"cap ({source_text})")
     return vals
+
+
+def _read_corrected_envelope_map(path: Path) -> Dict[float, float]:
+    """Read an envelope curve, preferring the first-order-corrected column."""
+    if not path.exists():
+        return {}
+    out: Dict[float, float] = {}
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            ell = _safe_float(row.get("ell"))
+            f_val = _safe_float(row.get("f_mu0_plus_mu1"))
+            if f_val is None:
+                f_val = _safe_float(row.get("f_mu0"))
+            if f_val is None:
+                f_val = _safe_float(row.get("f_mean"))
+            if ell is not None and ell > 0.0 and f_val is not None and f_val > 0.0:
+                out[ell] = f_val
+    return out
+
+
+def _simple_linear_fit(xs: List[float], ys: List[float]) -> Tuple[Optional[float], Optional[float], int]:
+    """Return slope and R^2 for a simple linear fit."""
+    pairs = [(x, y) for x, y in zip(xs, ys) if math.isfinite(x) and math.isfinite(y)]
+    n = len(pairs)
+    if n < 2:
+        return None, None, n
+    x_mean = sum(x for x, _ in pairs) / n
+    y_mean = sum(y for _, y in pairs) / n
+    sxx = sum((x - x_mean) ** 2 for x, _ in pairs)
+    if sxx <= 0.0:
+        return None, None, n
+    sxy = sum((x - x_mean) * (y - y_mean) for x, y in pairs)
+    slope = sxy / sxx
+    intercept = y_mean - slope * x_mean
+    ss_res = sum((y - (intercept + slope * x)) ** 2 for x, y in pairs)
+    ss_tot = sum((y - y_mean) ** 2 for _, y in pairs)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else None
+    return slope, r2, n
+
+
+def _load_corrected_envelope_power_summary(exp2_dir: Path, arch: str) -> Dict[str, object]:
+    """Mirror the paper-facing corrected-envelope curve used by the plotter."""
+    seed_maps: List[Dict[float, float]] = []
+    for seed_dir in sorted(exp2_dir.glob("seed_*")):
+        vals = _read_corrected_envelope_map(seed_dir / arch / f"{arch}_envelope_audit.csv")
+        if vals:
+            seed_maps.append(vals)
+
+    source = ""
+    curve: Dict[float, float] = {}
+    n_seed_curves = 0
+    if seed_maps:
+        common_ells = sorted(set.intersection(*(set(m.keys()) for m in seed_maps)))
+        if len(common_ells) >= 6:
+            n_seed_curves = len(seed_maps)
+            curve = {
+                ell: sum(m[ell] for m in seed_maps) / len(seed_maps)
+                for ell in common_ells
+            }
+            source = f"mu0+mu1 mean across {len(seed_maps)} seeds"
+
+    if not curve:
+        agg = exp2_dir / "aggregated" / arch
+        curve = _read_corrected_envelope_map(agg / f"{arch}_envelope_audit.csv")
+        if curve:
+            source = "mu0+mu1 aggregate"
+        else:
+            curve = _read_corrected_envelope_map(agg / f"{arch}_envelope.csv")
+            source = "mu0 aggregate" if curve else "missing"
+
+    ell = sorted(e for e, v in curve.items() if e > 0.0 and v > 0.0)
+    log_ell = [math.log(e) for e in ell]
+    log_f = [math.log(curve[e]) for e in ell]
+    slope, r2, n = _simple_linear_fit(log_ell, log_f)
+    beta = max(0.0, -slope) if slope is not None else None
+
+    corr_vals: List[float] = []
+    audit = exp2_dir / "aggregated" / arch / f"{arch}_envelope_audit.csv"
+    if audit.exists():
+        with open(audit) as f:
+            for row in csv.DictReader(f):
+                v = _safe_float(row.get("corr_ratio_mu1_over_mu0"))
+                if v is not None:
+                    corr_vals.append(v)
+
+    return {
+        "corrected_envelope_source": source,
+        "corrected_envelope_n_seed_curves": n_seed_curves,
+        "corrected_envelope_power_beta": beta,
+        "corrected_envelope_power_r2": r2,
+        "corrected_envelope_power_n": n,
+        "corr_ratio_median": _quantile(corr_vals, 0.50) if corr_vals else None,
+        "corr_ratio_max": max(corr_vals) if corr_vals else None,
+    }
 
 
 # ----- Per-architecture record -----
 def collect_arch_record(
-    exp2_dir: Path, arch: str,
+    exp2_dir: Path, arch: str, tau_cap_mode: str = "seq_len",
 ) -> Dict[str, object]:
     """Collect the per-architecture summary record from the aggregates."""
     agg_dir = exp2_dir / "aggregated" / arch
     rec: Dict[str, object] = {"arch": arch}
 
-    # Phase verdict and final-epoch envelope numbers from <arch>_final_phase.json
+    # Phase labels and final-epoch envelope numbers from <arch>_final_phase.json
     fp = _load_json(agg_dir / f"{arch}_final_phase.json")
     rec["final_phase_present"] = fp is not None
     if fp is not None:
@@ -176,24 +396,101 @@ def collect_arch_record(
         rec["majority_phase_label"] = "—"
         rec["majority_phase_fraction"] = float("nan")
 
-    # Final-epoch beta_env and spontaneous forcing proxy from the aggregated
-    # phase trajectory. The reliability flag is retained internally as audit,
-    # but the summary foregrounds alpha_ECF rather than log-like flags.
+    # Final-epoch beta_env and slow-mode forcing readout from the aggregated
+    # phase trajectory. Legacy pooled alpha fields may still exist in the CSV,
+    # but they are no longer the paper-facing forcing diagnostic.
     last = _load_last_row(agg_dir / "phase_trajectory_aggregated.csv")
     if last is not None:
         rec["beta_env_final_mean"] = last.get("beta_env_mean")
         rec["beta_env_final_se"] = last.get("beta_env_se")
         rec["beta_env_r2_final_mean"] = last.get("beta_env_r2_mean")
-        rec["alpha_reliable_final"] = last.get("alpha_reliable_mean")
-        rec["alpha_ecf_final"] = last.get("alpha_ecf_mean")
+        rec["forcing_alpha_final"] = last.get("forcing_alpha_hat_mean")
+        rec["forcing_alpha_final_se"] = last.get("forcing_alpha_hat_se")
+        rec["forcing_alpha_reliable_final"] = last.get("forcing_alpha_reliable_mean")
+        rec["forcing_gaussian_p_value_final"] = last.get("forcing_gaussian_p_value_mean")
+        rec["forcing_gaussian_p_value_floor_final"] = last.get("forcing_gaussian_p_value_floor_mean")
+        rec["forcing_gaussian_p_value_at_floor_final"] = last.get("forcing_gaussian_p_value_at_floor_mean")
+        rec["forcing_gaussian_reject_final"] = last.get("forcing_gaussian_reject_mean")
+        rec["forcing_detectably_heavy_final"] = last.get("forcing_alpha_detectably_heavy_mean")
+        rec["forcing_substantively_heavy_final"] = last.get("forcing_alpha_substantively_heavy_mean")
+        rec["forcing_resolvably_heavy_final"] = last.get("forcing_alpha_resolvably_heavy_mean")
+        rec["forcing_alpha_substantive_threshold_final"] = last.get("forcing_alpha_substantive_threshold_mean")
+        rec["forcing_alpha2_band_lo_final"] = last.get("forcing_alpha2_band_lo_mean")
+        rec["forcing_alpha2_band_hi_final"] = last.get("forcing_alpha2_band_hi_mean")
+        rec["forcing_heavy_fraction_final"] = last.get("forcing_heavy_fraction_mean")
         rec["final_epoch"] = last.get("epoch")
     else:
         rec["beta_env_final_mean"] = None
         rec["beta_env_final_se"] = None
         rec["beta_env_r2_final_mean"] = None
-        rec["alpha_reliable_final"] = None
-        rec["alpha_ecf_final"] = None
+        rec["forcing_alpha_final"] = None
+        rec["forcing_alpha_final_se"] = None
+        rec["forcing_alpha_reliable_final"] = None
+        rec["forcing_gaussian_p_value_final"] = None
+        rec["forcing_gaussian_p_value_floor_final"] = None
+        rec["forcing_gaussian_p_value_at_floor_final"] = None
+        rec["forcing_gaussian_reject_final"] = None
+        rec["forcing_detectably_heavy_final"] = None
+        rec["forcing_substantively_heavy_final"] = None
+        rec["forcing_resolvably_heavy_final"] = None
+        rec["forcing_alpha_substantive_threshold_final"] = None
+        rec["forcing_alpha2_band_lo_final"] = None
+        rec["forcing_alpha2_band_hi_final"] = None
+        rec["forcing_heavy_fraction_final"] = None
         rec["final_epoch"] = None
+
+    # Drift-subtracted ζ-residual forcing diagnostic. This is the
+    # paper-facing forcing view: increments in the modeled log-rate coordinate,
+    # after subtracting a nonparametric conditional drift estimate.
+    residual_dir = exp2_dir / f"zeta_residual_forcing_{arch}"
+    residual_summary = _load_last_row(residual_dir / "zeta_residual_forcing_summary.csv")
+    if residual_summary is not None:
+        rec["zeta_resid_n_tail"] = residual_summary.get("n_tail_residual_samples_used")
+        rec["zeta_resid_tail_zeta_cut"] = residual_summary.get("tail_zeta_cut")
+        rec["zeta_resid_alpha_eff"] = residual_summary.get("alpha_eff")
+        rec["zeta_resid_alpha_eff_lo"] = residual_summary.get("alpha_eff_lo")
+        rec["zeta_resid_alpha_eff_hi"] = residual_summary.get("alpha_eff_hi")
+        rec["zeta_resid_xi_hat"] = residual_summary.get("xi_hat")
+        rec["zeta_resid_gaussian_p_value"] = residual_summary.get("gaussian_p_value")
+        rec["zeta_resid_gaussian_p_value_floor"] = residual_summary.get("gaussian_p_value_floor")
+        rec["zeta_resid_gaussian_p_value_at_floor"] = residual_summary.get("gaussian_p_value_at_floor")
+        rec["zeta_resid_gaussian_reject"] = residual_summary.get("gaussian_reject")
+        rec["zeta_resid_detectably_heavy"] = residual_summary.get("detectably_heavy")
+        rec["zeta_resid_substantively_heavy"] = residual_summary.get("substantively_heavy")
+        rec["zeta_resid_reliable"] = residual_summary.get("reliable")
+        rec["zeta_resid_k_selected"] = residual_summary.get("k_selected")
+    else:
+        rec["zeta_resid_n_tail"] = None
+        rec["zeta_resid_tail_zeta_cut"] = None
+        rec["zeta_resid_alpha_eff"] = None
+        rec["zeta_resid_alpha_eff_lo"] = None
+        rec["zeta_resid_alpha_eff_hi"] = None
+        rec["zeta_resid_xi_hat"] = None
+        rec["zeta_resid_gaussian_p_value"] = None
+        rec["zeta_resid_gaussian_p_value_floor"] = None
+        rec["zeta_resid_gaussian_p_value_at_floor"] = None
+        rec["zeta_resid_gaussian_reject"] = None
+        rec["zeta_resid_detectably_heavy"] = None
+        rec["zeta_resid_substantively_heavy"] = None
+        rec["zeta_resid_reliable"] = None
+        rec["zeta_resid_k_selected"] = None
+
+    residual_metrics = _load_json(residual_dir / "zeta_residual_forcing_metrics.json")
+    if residual_metrics is not None:
+        rec["zeta_resid_n_runs"] = residual_metrics.get("n_runs")
+        rec["zeta_resid_dt_is_constant"] = residual_metrics.get("dt_is_constant")
+        rec["zeta_resid_dt_unique"] = residual_metrics.get("dt_unique")
+        rec["zeta_resid_standardization"] = residual_metrics.get("standardization")
+        std_info = residual_metrics.get("standardization_info", {}) or {}
+        rec["zeta_resid_unit_scaled_tail_samples"] = std_info.get("n_unit_scaled_tail_samples")
+        rec["zeta_resid_global_fallback_tail_samples"] = std_info.get("n_global_fallback_tail_samples")
+    else:
+        rec["zeta_resid_n_runs"] = None
+        rec["zeta_resid_dt_is_constant"] = None
+        rec["zeta_resid_dt_unique"] = None
+        rec["zeta_resid_standardization"] = None
+        rec["zeta_resid_unit_scaled_tail_samples"] = None
+        rec["zeta_resid_global_fallback_tail_samples"] = None
 
     # Threshold-crossing per-seed table.
     tc = _load_json(agg_dir / f"{arch}_threshold_crossing.json")
@@ -241,8 +538,9 @@ def collect_arch_record(
     # Final time-scale spectrum. The ζ quantiles are the SDE/drift coordinate;
     # the τ quantiles summarize the right tail that feeds the envelope theorem.
     # These are descriptive empirical summaries, not Gaussian/log-normal fits.
-    tau_vals = _load_final_tau_values(exp2_dir, arch)
+    tau_vals = _load_final_tau_values(exp2_dir, arch, tau_cap_mode=tau_cap_mode)
     rec["tau_spectrum_n"] = len(tau_vals)
+    rec["tau_cap_mode"] = tau_cap_mode
     if tau_vals:
         zeta_vals = [-math.log(t) for t in tau_vals if math.isfinite(t) and t > 0.0]
         for name, q in (
@@ -254,12 +552,18 @@ def collect_arch_record(
         ):
             rec[f"zeta_{name}_final"] = _quantile(zeta_vals, q)
             rec[f"tau_{name}_final"] = _quantile(tau_vals, q)
+        z10 = rec.get("zeta_q10_final")
+        z90 = rec.get("zeta_q90_final")
+        if isinstance(z10, (int, float)) and isinstance(z90, (int, float)):
+            rec["delta_zeta_capped"] = float(z90) - float(z10)
+
+    rec.update(_load_corrected_envelope_power_summary(exp2_dir, arch))
 
     return rec
 
 
-# ----- Headline-verdict heuristic -----
-def _verdict_for_arch(rec: Dict[str, object]) -> str:
+# ----- Compact overview heuristic -----
+def _phase_bucket_for_arch(rec: Dict[str, object]) -> str:
     """Three-bucket label: 'collapsed', 'canonical AC', 'robust AC', or 'no data'.
 
     Uses the majority_phase_label when present, falling back to 'no data'.
@@ -270,58 +574,16 @@ def _verdict_for_arch(rec: Dict[str, object]) -> str:
     return "no data"
 
 
-def build_headline(records: List[Dict[str, object]]) -> str:
-    """Generate the headline paragraph identifying the transition rung.
-
-    The capacity ladder is the order of ``records`` (caller passes them in
-    ladder order). The headline points to the first rung that reaches a
-    sustained anti-collapsed verdict (canonical AC or better) and, if any
-    rung downstream of that one collapses again, flags the non-monotonic
-    case explicitly.
-    """
-    ladder = [(_verdict_for_arch(r), r) for r in records]
-    first_ac_idx = next(
-        (i for i, (v, _) in enumerate(ladder) if v in ("canonical AC", "robust AC")),
-        None,
-    )
-    if first_ac_idx is None:
-        return (
-            "**Headline verdict.** No rung of the capacity ladder reaches a "
-            "sustained anti-collapsed phase verdict in the canonical "
-            "full-trajectory diagnostic. Within the explored ladder, the "
-            "architectural transition to a stable anti-collapsed spectrum is not "
-            "observed."
-        )
-
-    first_arch = ARCH_LABEL.get(ladder[first_ac_idx][1]["arch"], ladder[first_ac_idx][1]["arch"])
-    below = ladder[:first_ac_idx]
-    above = ladder[first_ac_idx:]
-
-    below_summary = (
-        f"the {len(below)} lower rung(s) "
-        f"({', '.join(ARCH_LABEL.get(r['arch'], r['arch']) for _, r in below)}) "
-        f"remain collapsed"
-        if below else "no rung below it is collapsed (the lowest rung itself transitions)"
-    )
-
-    above_verdicts = [v for v, _ in above]
-    if all(v in ("canonical AC", "robust AC") for v in above_verdicts):
-        upward = (
-            f"all rungs at and above {first_arch} reach anti-collapse "
-            f"(verdict counts in the table)"
-        )
-    else:
-        upward = (
-            "anti-collapse is non-monotone along the ladder: at least one rung "
-            f"above {first_arch} falls back to collapsed (see the per-architecture "
-            "row in the table)"
-        )
-
+def build_overview(records: List[Dict[str, object]]) -> str:
+    """Generate a neutral route-readout overview for audit summaries."""
+    names = [ARCH_LABEL.get(r["arch"], r["arch"]) for r in records]
     return (
-        f"**Headline verdict.** The capacity-ladder transition first occurs at "
-        f"**{first_arch}**: {below_summary}, while {upward}. This pins the "
-        f"minimum architectural rung at which spontaneous training realizes "
-        f"stable anti-collapse on this task to {first_arch}."
+        "**Audit overview.** This file reports the SharedGate/DiagGate route "
+        "readout: spectra, corrected envelopes, far-left drift, update-space "
+        "forcing audits, and drift-subtracted ζ-residual forcing measurements "
+        f"for {', '.join(names)}. The recorded labels are included "
+        "for audit only; manuscript interpretation should be made from the "
+        "measured observables."
     )
 
 
@@ -331,33 +593,35 @@ def render_markdown(
     exp2_dir: Path,
     profile: str,
     seeds: Optional[str],
+    tau_cap_mode: str,
 ) -> str:
     """Render the full markdown summary."""
     n_seeds = max((int(r.get("n_seeds", 0)) for r in records), default=0)
     seeds_str = seeds if seeds else f"{n_seeds} (auto-detected)"
 
     lines: List[str] = []
-    lines.append(f"# Experiment 2 — Dynamical phase trajectory across the capacity ladder")
+    lines.append(f"# Experiment 2 — Access route through trainable diagonal gates")
     lines.append("")
     lines.append(f"**Source:** `{exp2_dir}`")
     lines.append(f"**Profile:** `{profile}`")
     lines.append(f"**Seeds:** {seeds_str}")
+    lines.append(f"**Time-scale summary cap:** `{tau_cap_mode}`")
     lines.append(
         "**Setup:** same long-memory regression task and diagnostic pipeline as "
-        "Experiment 1, with no heavy-tailed gradient injection. Architectures "
-        "are walked in capacity-ladder order; each architecture's per-seed "
-        "aggregates were computed by `main_phase_trajectory.py` and reduced to the "
-        "headline numbers below."
+        "Experiment 1, with no heavy-tailed injection. SharedGate is the "
+        "trainable collapsed reference and DiagGate is the per-unit trainable-gate "
+        "route candidate. Per-seed aggregates were computed by "
+        "`main_phase_trajectory.py` and reduced to the summary numbers below."
     )
     lines.append("")
-    lines.append(build_headline(records))
+    lines.append(build_overview(records))
     lines.append("")
 
-    # --- Phase-verdict-per-rung table ---
-    lines.append("## Per-architecture verdicts")
+    # --- Phase-label-per-architecture table ---
+    lines.append("## Per-architecture recorded labels")
     lines.append("")
     lines.append(
-        "| Rung | n_seeds | Majority phase | Counts (collapsed / canonical AC / robust AC) "
+        "| Architecture | n_seeds | Recorded label | Counts (collapsed / canonical AC / robust AC) "
         "| envelope_winner | crossover mode |"
     )
     lines.append("|------|--------:|----------------|-----------------------------------------------"
@@ -372,16 +636,16 @@ def render_markdown(
         )
     lines.append("")
 
-    # --- Envelope / dynamic range / drift table ---
-    lines.append("## Headline numbers")
+    # --- Envelope / dynamic range / drift / forcing table ---
+    lines.append("## Summary numbers")
     lines.append("")
     lines.append(
-        "| Rung | β̂_env(final) ± SE | β̂_tail (boot 90% CI)              | Δζ (final) "
-        "| κ_tail @ q_low=0.10 (90% CI)        | α_ECF(final) | t_cross (crossed/seeds) |"
+        "| Architecture | β̂_env(final) ± SE | β̂_tail (boot 90% CI) | Δζ (capped final) "
+        "| κ_tail @ q_low=0.10 (90% CI) | ζ-resid α_eff | ζ-resid Gaussian p | t_cross (crossed/seeds) |"
     )
     lines.append(
-        "|------|---------------------|-------------------------------------|------------"
-        "|--------------------------------------|--------------|-------------------------|"
+        "|--------------|---------------------|-----------------------------|------------"
+        "|--------------------------------------|---------------|----------------------|-------------------------|"
     )
     for r in records:
         boot = "—"
@@ -397,12 +661,128 @@ def render_markdown(
                 f"[{_fmt(r.get('kappa_tail_q10_lo'), 4)}, {_fmt(r.get('kappa_tail_q10_hi'), 4)}]"
             )
         beta_env = f"{_fmt(r.get('beta_env_final_mean'), 3)} ± {_fmt(r.get('beta_env_final_se'), 3)}"
+        zeta_resid_alpha = (
+            f"{_fmt(r.get('zeta_resid_alpha_eff'), 3)} "
+            f"[{_fmt(r.get('zeta_resid_alpha_eff_lo'), 3)}, "
+            f"{_fmt(r.get('zeta_resid_alpha_eff_hi'), 3)}]"
+        )
+        zeta_resid_p = _fmt_p_value(
+            r.get("zeta_resid_gaussian_p_value"),
+            r.get("zeta_resid_gaussian_p_value_floor"),
+            r.get("zeta_resid_gaussian_p_value_at_floor"),
+            3,
+        )
         t_cross = f"{r.get('t_cross_n_crossed', 0)}/{r.get('t_cross_n_seeds', 0)}"
+        delta_zeta = r.get("delta_zeta_capped", r.get("delta_zeta"))
         lines.append(
             f"| {ARCH_LABEL.get(r['arch'], r['arch'])} | {beta_env} | {boot} | "
-            f"{_fmt(r.get('delta_zeta'), 3)} | {kappa} | "
-            f"{_fmt(r.get('alpha_ecf_final'), 3)} | {t_cross} |"
+            f"{_fmt(delta_zeta, 3)} | {kappa} | "
+            f"{zeta_resid_alpha} | {zeta_resid_p} | {t_cross} |"
         )
+    lines.append("")
+
+    # --- Drift-subtracted ζ-residual forcing diagnostics ---
+    lines.append("## Drift-subtracted ζ-residual forcing")
+    lines.append("")
+    lines.append(
+        "| Architecture | runs | tail samples | ζ tail cut | α_eff (90% CI) | "
+        "Gaussian p | reject | reliable | dt constant | unit/global scaled samples |"
+    )
+    lines.append(
+        "|--------------|-----:|-------------:|-----------:|----------------|------------|--------|----------|-------------|----------------------------|"
+    )
+    for r in records:
+        alpha_ci = (
+            f"{_fmt(r.get('zeta_resid_alpha_eff'), 3)} "
+            f"[{_fmt(r.get('zeta_resid_alpha_eff_lo'), 3)}, "
+            f"{_fmt(r.get('zeta_resid_alpha_eff_hi'), 3)}]"
+        )
+        p = _fmt_p_value(
+            r.get("zeta_resid_gaussian_p_value"),
+            r.get("zeta_resid_gaussian_p_value_floor"),
+            r.get("zeta_resid_gaussian_p_value_at_floor"),
+            3,
+        )
+        unit_global = (
+            f"{_fmt_int(r.get('zeta_resid_unit_scaled_tail_samples'))}/"
+            f"{_fmt_int(r.get('zeta_resid_global_fallback_tail_samples'))}"
+        )
+        lines.append(
+            f"| {ARCH_LABEL.get(r['arch'], r['arch'])} | {_fmt_int(r.get('zeta_resid_n_runs'))} | "
+            f"{_fmt_int(r.get('zeta_resid_n_tail'))} | "
+            f"{_fmt(r.get('zeta_resid_tail_zeta_cut'), 3)} | {alpha_ci} | {p} | "
+            f"{_fmt(r.get('zeta_resid_gaussian_reject'), 2)} | "
+            f"{_fmt(r.get('zeta_resid_reliable'), 2)} | "
+            f"{_fmt(r.get('zeta_resid_dt_is_constant'), 0)} | {unit_global} |"
+        )
+    lines.append("")
+    lines.append(
+        "This is the paper-facing forcing diagnostic: checkpoint-to-checkpoint "
+        "increments in the far-left ζ slice after subtracting a nonparametric "
+        "conditional-drift estimate and robustly standardizing per unit. The "
+        "Gaussian p-value tests a matched-sample light-tail null; α_eff is an "
+        "effect-size calibration, not a direct estimate of a generator parameter."
+    )
+    lines.append("")
+
+    # --- Update-space forcing audit ---
+    lines.append("## Update-space forcing audit")
+    lines.append("")
+    lines.append(
+        "| Architecture | α_eff(final) ± SE | Gaussian p | reject-Gaussian | "
+        "substantive-heavy | reliability |"
+    )
+    lines.append(
+        "|--------------|-------------------|------------|-----------------|-------------------|-------------|"
+    )
+    for r in records:
+        forcing = f"{_fmt(r.get('forcing_alpha_final'), 3)} ± {_fmt(r.get('forcing_alpha_final_se'), 3)}"
+        gaussian_p = _fmt_p_value(
+            r.get("forcing_gaussian_p_value_final"),
+            r.get("forcing_gaussian_p_value_floor_final"),
+            r.get("forcing_gaussian_p_value_at_floor_final"),
+            3,
+        )
+        lines.append(
+            f"| {ARCH_LABEL.get(r['arch'], r['arch'])} | {forcing} | {gaussian_p} | "
+            f"{_fmt(r.get('forcing_gaussian_reject_final'), 2)} | "
+            f"{_fmt(r.get('forcing_substantively_heavy_final'), 2)} | "
+            f"{_fmt(r.get('forcing_alpha_reliable_final'), 2)} |"
+        )
+    lines.append("")
+    lines.append(
+        "This table is retained as an upstream audit of parameter-update "
+        "increments. The ζ-residual table above is the coordinate matched to "
+        "the stochastic log-rate model."
+    )
+    lines.append("")
+
+    # --- Corrected envelope audit ---
+    lines.append("## Corrected envelope audit")
+    lines.append("")
+    lines.append(
+        "| Architecture | source | full-window β_power | R² | n points | corr-ratio median | corr-ratio max |"
+    )
+    lines.append(
+        "|--------------|--------|--------------------:|---:|---------:|------------------:|---------------:|"
+    )
+    for r in records:
+        lines.append(
+            f"| {ARCH_LABEL.get(r['arch'], r['arch'])} | "
+            f"{r.get('corrected_envelope_source', '—')} | "
+            f"{_fmt(r.get('corrected_envelope_power_beta'), 3)} | "
+            f"{_fmt(r.get('corrected_envelope_power_r2'), 3)} | "
+            f"{_fmt_int(r.get('corrected_envelope_power_n'))} | "
+            f"{_fmt(r.get('corr_ratio_median'), 3)} | "
+            f"{_fmt(r.get('corr_ratio_max'), 3)} |"
+        )
+    lines.append("")
+    lines.append(
+        "The paper-facing envelope comparison uses the first-order-corrected "
+        "`μ₀+μ₁` curve when the audit CSV is available, averaged across seed "
+        "curves before taking logs. The correction-ratio columns summarize "
+        "the size of the first-order term relative to the canonical kernel."
+    )
     lines.append("")
 
     # --- Final time-scale spectrum table ---
@@ -424,7 +804,7 @@ def render_markdown(
             f"{_fmt(r.get('zeta_q50_final'), 3)} | "
             f"{_fmt(r.get('zeta_q90_final'), 3)} | "
             f"{_fmt(r.get('zeta_q99_final'), 3)} | "
-            f"{_fmt(r.get('delta_zeta'), 3)} | "
+            f"{_fmt(r.get('delta_zeta_capped'), 3)} | "
             f"{_fmt(r.get('tau_q50_final'), 1)} | "
             f"{_fmt(r.get('tau_q90_final'), 1)} | "
             f"{_fmt(r.get('tau_q99_final'), 1)} |"
@@ -433,10 +813,9 @@ def render_markdown(
     lines.append(
         "The ζ columns show the log-rate coordinate modeled by the drift SDE; "
         "the τ columns summarize the right tail that enters the "
-        "spectrum-to-envelope correspondence. Large isolated values of τ are "
-        "reported here, but they should be interpreted together with the "
-        "τ-CCDF figure: anti-collapse requires a resolved scaling window, not "
-        "a few far-tail outliers."
+        "spectrum-to-envelope correspondence. The table applies the same "
+        "finite-resolution τ cap as the generated spectrum summary; raw "
+        "per-checkpoint τ CSVs are left unchanged for audit."
     )
     lines.append("")
 
@@ -464,29 +843,27 @@ def render_markdown(
     lines.append("## Notes")
     lines.append("")
     lines.append(
-        "- Macro-envelope `f(ℓ)` here is the canonical zero-order `μ₀` kernel "
-        "(see `diagnostics.compute_macro_envelope_comparison`). The legacy "
-        "`μ₀+μ₁` envelope and the per-lag correction ratio are still written "
-        "to `<arch>_envelope_audit.csv` for audit."
+        "- The paper-facing envelope figure uses the corrected `μ₀+μ₁` curve "
+        "when available; the canonical `μ₀` envelope and correction-ratio "
+        "columns remain in `<arch>_envelope_audit.csv` for audit."
     )
     lines.append(
-        "- Phase labels come from the canonical Table-1 rule applied to "
+        "- Phase labels are recorded by the diagnostic pipeline in "
         "`<arch>_final_phase.json` at the end of training; the majority label "
-        "is reported as the headline phase for each rung."
+        "is reported as a compact per-rung observable."
     )
     lines.append(
         "- Drift κ_tail is read at the primary `q_low=0.10` slice. The full "
         "quantile-cut sweep is in `drift_<arch>/tail_saturation.json`."
     )
     lines.append(
-        "- The final spectrum table is paired with `exp2_time_scale_spectrum.png`: "
+        "- The final spectrum table is paired with `exp2_time_scale_spectrum_fitlag.png`: "
         "`p(ζ)` is the drift-coordinate view, while the log-log τ-CCDF is the "
         "direct visual check for a regularly varying time-scale tail."
     )
     lines.append(
-        "- This file is regenerated by `write_exp2_summary.py`; hand-edit only "
-        "after appending a `## Manual notes` section so subsequent regenerations "
-        "preserve the human commentary."
+        "- This file is regenerated by `write_exp2_summary.py`. Add durable "
+        "analysis below a `## Manual notes` heading if needed."
     )
 
     return "\n".join(lines) + "\n"
@@ -510,8 +887,8 @@ def main() -> None:
              "results/exp2_phase_full/adamw",
     )
     ap.add_argument(
-        "--architectures", type=str, default="shared,diag,gru,lstm",
-        help="Comma-separated architecture short names in capacity-ladder order.",
+        "--architectures", type=str, default="shared,diag",
+        help="Comma-separated architecture short names.",
     )
     ap.add_argument(
         "--output", type=Path, default=None,
@@ -525,6 +902,12 @@ def main() -> None:
     ap.add_argument(
         "--seeds", type=str, default=None,
         help="Comma-separated seed list to embed in the summary (optional).",
+    )
+    ap.add_argument(
+        "--tau_cap_mode", type=str, default="seq_len", choices=_TAU_CAP_MODES,
+        help="Finite-resolution cap for final τ-spectrum quantiles. `seq_len` "
+             "uses τ <= T; `fit_lag_max` uses τ <= max(tau_fit_lags); `raw` "
+             "keeps all finite positive τ values.",
     )
     args = ap.parse_args()
 
@@ -547,8 +930,11 @@ def main() -> None:
         output = results_root / f"exp2_phase_{profile}_results_summary.md"
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    records = [collect_arch_record(args.exp2_dir, arch) for arch in architectures]
-    md = render_markdown(records, args.exp2_dir, profile, args.seeds)
+    records = [
+        collect_arch_record(args.exp2_dir, arch, tau_cap_mode=args.tau_cap_mode)
+        for arch in architectures
+    ]
+    md = render_markdown(records, args.exp2_dir, profile, args.seeds, args.tau_cap_mode)
     with open(output, "w") as f:
         f.write(md)
     print(f"wrote {output}")
