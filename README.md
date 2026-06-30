@@ -5,8 +5,7 @@ Code for the empirical validation in:
 **Lorenzo Livi**  
 *Anti-Collapse Dynamics and the Emergence of Multi-Time-Scale Learning in Recurrent Neural Networks*
 
-Preprint: forthcoming. arXiv, DOI, and preferred citation details will be
-added when the manuscript is public.
+Preprint: [arXiv:2606.29519](https://arxiv.org/abs/2606.29519).
 
 This repository contains the training, diagnostic, and plotting pipeline for
 the two main-text experiments. The experiments test when trained gated
@@ -237,9 +236,22 @@ For larger compute budgets, the cleanest scaling knobs are:
 
 ## Citation
 
-Citation metadata is intentionally provisional until the preprint is public.
-The repository includes `CITATION.cff`; arXiv and DOI details will be added at
-release time.
+If you use this code, please cite the accompanying preprint:
+
+```bibtex
+@misc{livi2026anticollapse,
+  title = {Anti-Collapse Dynamics and the Emergence of Multi-Time-Scale Learning in Recurrent Neural Networks},
+  author = {Livi, Lorenzo},
+  year = {2026},
+  eprint = {2606.29519},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.LG},
+  url = {https://arxiv.org/abs/2606.29519}
+}
+```
+
+The repository also includes `CITATION.cff` for citation managers and GitHub's
+citation widget.
 
 ## License
 

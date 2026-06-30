@@ -1,8 +1,19 @@
 cff-version: 1.2.0
 title: "Anti-Collapse Dynamics in Gated Recurrent Neural Networks"
-message: "Template citation metadata only. Public manuscript links, DOI, and preferred citation will be added later."
+message: "If you use this code, please cite the accompanying arXiv preprint."
 authors:
   - family-names: Livi
     given-names: Lorenzo
 type: software
 license: MIT
+repository-code: "https://github.com/lorenzolivi/anticollapse"
+url: "https://arxiv.org/abs/2606.29519"
+preferred-citation:
+  type: article
+  title: "Anti-Collapse Dynamics and the Emergence of Multi-Time-Scale Learning in Recurrent Neural Networks"
+  authors:
+    - family-names: Livi
+      given-names: Lorenzo
+  year: 2026
+  journal: "arXiv preprint arXiv:2606.29519"
+  url: "https://arxiv.org/abs/2606.29519"
